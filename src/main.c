@@ -4,24 +4,33 @@
 #include <string.h>
 #include <time.h>
 #include <math.h> // Pour fminf, fmaxf
-
+#include <stdlib.h>
+#include <pthread.h> // Pour les threads
+#include <dirent.h> // Pour parcourir les répertoires
+#include <unistd.h> // Pour access()
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN // Exclure les en-têtes inutiles de Windows
+#define NOUSER // Exclure les en-têtes inutiles de Windows
+#define NOGDI // Exclure les en-têtes inutiles de Windows
+#include <windows.h> // Pour Sleep
+#undef LoadImage // Éviter le conflit avec la fonction WinAPI
+#endif
 #define UNUSED (void)
 
-#define ENABLE_LOGGING 0 // Activer ou désactiver le logging
+#define ENABLE_LOGGING 1 // Activer temporairement le logging pour déboguer
 
 // Structure pour le logging avec gestion des patterns
-#define MAX_PATTERN_SIZE 32
+#define MAX_LOG_BUFFER 64
 #define MAX_MESSAGE_LENGTH 256
 
 typedef struct {
-    char messages[MAX_PATTERN_SIZE][MAX_MESSAGE_LENGTH];
-    int patternSize;
-    int patternCount;
-    int currentIndex;
+    char messages[MAX_LOG_BUFFER][MAX_MESSAGE_LENGTH];
+    int messageCount;
+    int writeIndex;
     FILE* logFile;
+    char lastMessage[MAX_MESSAGE_LENGTH];
+    int consecutiveCount;
 } LogManager;
-
-
 
 static LogManager gLogManager = {0};
 
@@ -34,42 +43,21 @@ void InitLogger(void) {
         fprintf(gLogManager.logFile, "=== LOG START ===\n");
         fflush(gLogManager.logFile);
     }
-    gLogManager.patternSize = 0;
-    gLogManager.patternCount = 0;
-    gLogManager.currentIndex = 0;
+    gLogManager.messageCount = 0;
+    gLogManager.writeIndex = 0;
+    gLogManager.consecutiveCount = 0;
+    gLogManager.lastMessage[0] = '\0';
 }
 
-void FlushPattern(void) {
-    if (!gLogManager.logFile || gLogManager.patternSize == 0) return;
-    
-    if (gLogManager.patternCount > 1) {
-        // Afficher le pattern avec compteur
-        if (gLogManager.patternSize == 1) {
-            fprintf(gLogManager.logFile, "%s x%d\n", gLogManager.messages[0], gLogManager.patternCount);
-        } else {
-            fprintf(gLogManager.logFile, "(");
-            for (int i = 0; i < gLogManager.patternSize; i++) {
-                fprintf(gLogManager.logFile, "%s", gLogManager.messages[i]);
-                if (i < gLogManager.patternSize - 1) {
-                    fprintf(gLogManager.logFile, "\n");
-                }
-            }
-            fprintf(gLogManager.logFile, ") x%d\n", gLogManager.patternCount);
-        }
-    } else {
-        // Afficher le pattern une seule fois
-        for (int i = 0; i < gLogManager.patternSize; i++) {
-            fprintf(gLogManager.logFile, "%s\n", gLogManager.messages[i]);
-        }
+void FlushConsecutiveMessages(void) {
+    if (gLogManager.consecutiveCount > 1) {
+        fprintf(gLogManager.logFile, "%s x%d\n", gLogManager.lastMessage, gLogManager.consecutiveCount);
+        fflush(gLogManager.logFile);
+    } else if (gLogManager.consecutiveCount == 1) {
+        fprintf(gLogManager.logFile, "%s\n", gLogManager.lastMessage);
+        fflush(gLogManager.logFile);
     }
-    fflush(gLogManager.logFile);
-}
-
-bool IsPatternMatch(const char* message) {
-    if (gLogManager.patternSize == 0) return false;
-    
-    int expectedIndex = gLogManager.currentIndex % gLogManager.patternSize;
-    return strcmp(gLogManager.messages[expectedIndex], message) == 0;
+    gLogManager.consecutiveCount = 0;
 }
 
 void LogMessage(const char* message) {
@@ -78,54 +66,30 @@ void LogMessage(const char* message) {
     #endif
     if (!gLogManager.logFile) return;
     
-    if (IsPatternMatch(message)) {
-        // Continue le pattern existant
-        gLogManager.currentIndex++;
-        
-        // Si on a complété un cycle complet du pattern
-        if (gLogManager.currentIndex % gLogManager.patternSize == 0) {
-            gLogManager.patternCount++;
-        }
-    } else {
-        // Flush le pattern précédent s'il existe
-        FlushPattern();
-        
-        // Tenter de détecter un nouveau pattern
-        bool foundPattern = false;
-        
-        // Chercher si ce message fait partie d'un pattern existant
-        for (int i = 0; i < gLogManager.patternSize; i++) {
-            if (strcmp(gLogManager.messages[i], message) == 0) {
-                // Nouveau pattern détecté, redémarrer à partir de ce message
-                gLogManager.currentIndex = i + 1;
-                gLogManager.patternCount = 1;
-                foundPattern = true;
-                break;
-            }
-        }
-        
-        if (!foundPattern) {
-            // Nouveau message, étendre le pattern ou en commencer un nouveau
-            if (gLogManager.patternSize < MAX_PATTERN_SIZE) {
-                strcpy(gLogManager.messages[gLogManager.patternSize], message);
-                gLogManager.patternSize++;
-                gLogManager.currentIndex = 1;
-                gLogManager.patternCount = 1;
-            } else {
-                // Pattern trop long, traiter comme message unique
-                fprintf(gLogManager.logFile, "%s\n", message);
-                fflush(gLogManager.logFile);
-                gLogManager.patternSize = 0;
-                gLogManager.patternCount = 0;
-                gLogManager.currentIndex = 0;
-            }
-        }
+    // Si c'est le même message que le précédent, juste incrémenter le compteur
+    if (gLogManager.consecutiveCount > 0 && strcmp(gLogManager.lastMessage, message) == 0) {
+        gLogManager.consecutiveCount++;
+        return;
+    }
+    
+    // Flush les messages consécutifs précédents
+    FlushConsecutiveMessages();
+    
+    // Commencer un nouveau message
+    strcpy(gLogManager.lastMessage, message);
+    gLogManager.consecutiveCount = 1;
+    
+    // Ajouter au buffer circulaire pour détection de patterns plus complexes
+    strcpy(gLogManager.messages[gLogManager.writeIndex], message);
+    gLogManager.writeIndex = (gLogManager.writeIndex + 1) % MAX_LOG_BUFFER;
+    if (gLogManager.messageCount < MAX_LOG_BUFFER) {
+        gLogManager.messageCount++;
     }
 }
 
 void CloseLogger(void) {
     if (gLogManager.logFile) {
-        FlushPattern();
+        FlushConsecutiveMessages();
         fprintf(gLogManager.logFile, "=== LOG END ===\n");
         fclose(gLogManager.logFile);
     }
@@ -139,25 +103,436 @@ time_t My_GetFileModTime(const char *path)
         return 0;
 }
 
-// Fonction pour charger une séquence d'images (pour GIF animé par exemple)
-bool LoadImageSequence(const char* filePath, Image** sequence, int* frameCount) {
-    // Pour l'instant, on simule avec une seule image
-    // Dans une vraie implémentation, on utiliserait une bibliothèque comme stb_image
-    // pour extraire toutes les frames d'un GIF
+// Structure pour le traitement vidéo avec FFmpeg
+typedef struct {
+    char inputPath[512];
+    char outputDir[512];
+    int frameCount;
+    float fps;
+    bool isProcessing;
+    bool isCompleted;
+    bool hasError;
+    bool ffmpegFinished;  // Nouveau flag pour indiquer si FFmpeg a terminé
+    char errorMessage[256];
+    pthread_t thread;
+    pthread_mutex_t mutex;
+    pthread_cond_t condition; // Pour la synchronisation
+} VideoProcessor;
+
+static VideoProcessor gVideoProcessor = {0};
+
+// Fonction pour initialiser le processeur vidéo
+void InitVideoProcessor(void) {
+    memset(&gVideoProcessor, 0, sizeof(VideoProcessor));
+    pthread_mutex_init(&gVideoProcessor.mutex, NULL);
+    pthread_cond_init(&gVideoProcessor.condition, NULL);
+    snprintf(gVideoProcessor.outputDir, sizeof(gVideoProcessor.outputDir), "./temp_frames/");
+    printf("Video processor initialized\n");
+}
+
+// Fonction pour nettoyer le répertoire temporaire
+void CleanupTempFrames(void) {
+    DIR* dir = opendir(gVideoProcessor.outputDir);
+    if (dir) {
+        struct dirent* entry;
+        while ((entry = readdir(dir)) != NULL) {
+            if (strstr(entry->d_name, "frame_") && strstr(entry->d_name, ".png")) {
+                char fullPath[1024];
+                snprintf(fullPath, sizeof(fullPath), "%s%s", gVideoProcessor.outputDir, entry->d_name);
+                remove(fullPath);
+            }
+        }
+        closedir(dir);
+    }
+    rmdir(gVideoProcessor.outputDir);
+}
+
+// Fonction thread pour traiter la vidéo avec FFmpeg
+void* ProcessVideoThread(void* arg) {
+    UNUSED arg;
     
-    *frameCount = 1;
-    *sequence = (Image*)malloc(sizeof(Image) * (*frameCount));
+    pthread_mutex_lock(&gVideoProcessor.mutex);
+    printf("=== VIDEO THREAD STARTED ===\n");
+    gVideoProcessor.isProcessing = true;
+    gVideoProcessor.isCompleted = false;
+    gVideoProcessor.hasError = false;
+    gVideoProcessor.ffmpegFinished = false;
+    pthread_mutex_unlock(&gVideoProcessor.mutex);
     
-    (*sequence)[0] = LoadImage(filePath);
+    // Créer le répertoire temporaire
+    printf("Creating temp directory...\n");
+    #ifdef _WIN32
+    int mkdirResult = system("if not exist temp_frames mkdir temp_frames");
+    #else
+    int mkdirResult = mkdir(gVideoProcessor.outputDir, 0755);
+    #endif
     
-    if ((*sequence)[0].data == NULL) {
-        free(*sequence);
-        *sequence = NULL;
-        *frameCount = 0;
+    if (mkdirResult != 0) {
+        printf("ERROR: Failed to create temp directory\n");
+        pthread_mutex_lock(&gVideoProcessor.mutex);
+        gVideoProcessor.hasError = true;
+        strcpy(gVideoProcessor.errorMessage, "Impossible de créer le répertoire temporaire");
+        gVideoProcessor.isProcessing = false;
+        pthread_cond_broadcast(&gVideoProcessor.condition);
+        pthread_mutex_unlock(&gVideoProcessor.mutex);
+        return NULL;
+    }
+    
+    // Commande FFmpeg pour extraire les frames et obtenir les informations
+    char ffmpegCmd[1024];
+    char ffprobeCmd[1024];
+    
+    printf("Getting video info with ffprobe...\n");
+    // D'abord, obtenir les informations sur la vidéo (FPS, durée, etc.)
+    snprintf(ffprobeCmd, sizeof(ffprobeCmd), "ffprobe -v quiet -select_streams v:0 -show_entries stream=r_frame_rate -of csv=p=0 \"%s\" > temp_fps.txt", 
+            gVideoProcessor.inputPath);
+    
+    int result = system(ffprobeCmd);
+    if (result == 0) {
+        // Lire le FPS de la vidéo
+        FILE* fpsFile = fopen("temp_fps.txt", "r");
+        if (fpsFile) {
+            char fpsString[64];
+            if (fgets(fpsString, sizeof(fpsString), fpsFile)) {
+                // Retirer le saut de ligne
+                fpsString[strcspn(fpsString, "\n")] = 0;
+                
+                // Gérer les fractions comme "30/1"
+                float num, den;
+                if (sscanf(fpsString, "%f/%f", &num, &den) == 2 && den > 0) {
+                    gVideoProcessor.fps = num / den;
+                } else {
+                    gVideoProcessor.fps = atof(fpsString);
+                }
+                printf("Detected FPS: %.2f\n", gVideoProcessor.fps);
+            }
+            fclose(fpsFile);
+        }
+        remove("temp_fps.txt");
+    } else {
+        printf("WARNING: Failed to get video FPS, using default\n");
+    }
+    
+    // Si on n'a pas pu obtenir le FPS, utiliser une valeur par défaut
+    if (gVideoProcessor.fps <= 0) {
+        gVideoProcessor.fps = 30.0f;
+        printf("Using default FPS: %.2f\n", gVideoProcessor.fps);
+    }
+    
+    // Extraire les frames avec FFmpeg
+    printf("Starting FFmpeg frame extraction...\n");
+    snprintf(ffmpegCmd, sizeof(ffmpegCmd), "ffmpeg -i \"%s\" \"%sframe_%%06d.png\" -y", 
+            gVideoProcessor.inputPath, gVideoProcessor.outputDir);
+    
+    printf("Executing FFmpeg command: %s\n", ffmpegCmd);
+    result = system(ffmpegCmd);
+    printf("FFmpeg command result: %d\n", result);
+    
+    // Marquer FFmpeg comme terminé
+    pthread_mutex_lock(&gVideoProcessor.mutex);
+    gVideoProcessor.ffmpegFinished = true;
+    printf("FFmpeg process finished with code: %d\n", result);
+    pthread_mutex_unlock(&gVideoProcessor.mutex);
+    
+    if (result != 0) {
+        printf("ERROR: FFmpeg failed with error code: %d\n", result);
+        pthread_mutex_lock(&gVideoProcessor.mutex);
+        gVideoProcessor.hasError = true;
+        snprintf(gVideoProcessor.errorMessage, sizeof(gVideoProcessor.errorMessage), 
+                "Erreur FFmpeg (code: %d)", result);
+        gVideoProcessor.isProcessing = false;
+        pthread_cond_broadcast(&gVideoProcessor.condition);
+        pthread_mutex_unlock(&gVideoProcessor.mutex);
+        return NULL;
+    }
+    
+    // Attendre et compter les frames de manière plus robuste
+    printf("FFmpeg extraction successful, counting frames...\n");
+    
+    int attempts = 0;
+    int lastCount = 0;
+    int stableCount = 0;
+    int maxAttempts = 15; // Augmenter encore plus le nombre de tentatives
+    int finalFrameCount = 0;
+    
+    while (attempts < maxAttempts) {
+        #ifdef _WIN32
+        Sleep(1000); // Attendre 1 seconde entre chaque tentative
+        #else
+        sleep(1);
+        #endif
+        
+        // Compter le nombre de frames générées
+        DIR* dir = opendir(gVideoProcessor.outputDir);
+        int count = 0;
+        if (dir) {
+            struct dirent* entry;
+            while ((entry = readdir(dir)) != NULL) {
+                if (strstr(entry->d_name, "frame_") && strstr(entry->d_name, ".png")) {
+                    // Vérifier que le fichier n'est pas vide (protection contre les fichiers en cours d'écriture)
+                    char fullPath[1024];
+                    snprintf(fullPath, sizeof(fullPath), "%s%s", gVideoProcessor.outputDir, entry->d_name);
+                    FILE* testFile = fopen(fullPath, "rb");
+                    if (testFile) {
+                        fseek(testFile, 0, SEEK_END);
+                        long size = ftell(testFile);
+                        fclose(testFile);
+                        if (size > 100) { // Fichier doit avoir au moins 100 bytes (PNG valide)
+                            count++;
+                        }
+                    }
+                }
+            }
+            closedir(dir);
+        }
+        
+        printf("Attempt %d/%d: Found %d frames (stable: %d)\n", 
+               attempts + 1, maxAttempts, count, stableCount);
+        
+        // Si le compte est stable (même nombre plusieurs fois de suite), on a probablement fini
+        if (count == lastCount && count > 0) {
+            stableCount++;
+            printf("Frame count stable at %d for %d attempts\n", count, stableCount);
+            if (stableCount >= 4) { // Augmenter encore le seuil de stabilité
+                finalFrameCount = count;
+                printf("Frame count stabilized at: %d\n", finalFrameCount);
+                break;
+            }
+        } else {
+            stableCount = 0;
+        }
+        
+        lastCount = count;
+        attempts++;
+    }
+    
+    // Utiliser le dernier compte même si pas stable
+    if (finalFrameCount == 0) {
+        finalFrameCount = lastCount;
+        printf("Using last count: %d (not stable)\n", finalFrameCount);
+    }
+    
+    // Finaliser le traitement
+    pthread_mutex_lock(&gVideoProcessor.mutex);
+    gVideoProcessor.frameCount = finalFrameCount;
+    printf("=== FINAL FRAME COUNT: %d ===\n", finalFrameCount);
+    
+    if (finalFrameCount > 0) {
+        gVideoProcessor.isCompleted = true;
+        gVideoProcessor.hasError = false;
+        printf("*** VIDEO PROCESSING COMPLETED SUCCESSFULLY ***\n");
+        printf("*** %d frames extracted at %.2f FPS ***\n", finalFrameCount, gVideoProcessor.fps);
+    } else {
+        gVideoProcessor.hasError = true;
+        strcpy(gVideoProcessor.errorMessage, "Aucune frame extraite");
+        printf("ERROR: No frames extracted\n");
+    }
+    
+    gVideoProcessor.isProcessing = false;
+    pthread_cond_broadcast(&gVideoProcessor.condition); // Notifier le thread principal
+    pthread_mutex_unlock(&gVideoProcessor.mutex);
+    
+    printf("=== VIDEO THREAD FINISHED ===\n");
+    return NULL;
+}
+
+// Fonction pour démarrer le traitement vidéo
+bool StartVideoProcessing(const char* videoPath) {
+    // Vérifier si un traitement est déjà en cours
+    pthread_mutex_lock(&gVideoProcessor.mutex);
+    if (gVideoProcessor.isProcessing) {
+        printf("WARNING: Video processing already in progress\n");
+        pthread_mutex_unlock(&gVideoProcessor.mutex);
         return false;
     }
     
+    printf("=== STARTING VIDEO PROCESSING ===\n");
+    printf("Video file: %s\n", videoPath);
+    
+    // Nettoyer les frames précédentes
+    CleanupTempFrames();
+    
+    // Réinitialiser les variables
+    gVideoProcessor.frameCount = 0;
+    gVideoProcessor.fps = 0.0f;
+    gVideoProcessor.isCompleted = false;
+    gVideoProcessor.hasError = false;
+    gVideoProcessor.ffmpegFinished = false;
+    gVideoProcessor.errorMessage[0] = '\0';
+    
+    // Copier le chemin de la vidéo
+    strcpy(gVideoProcessor.inputPath, videoPath);
+    pthread_mutex_unlock(&gVideoProcessor.mutex);
+    
+    // Créer le thread de traitement
+    int result = pthread_create(&gVideoProcessor.thread, NULL, ProcessVideoThread, NULL);
+    if (result != 0) {
+        printf("ERROR: Failed to create video processing thread (error: %d)\n", result);
+        return false;
+    }
+    
+    printf("Video processing thread created successfully\n");
     return true;
+}
+
+// Fonction pour charger les frames extraites
+bool LoadExtractedFrames(Image** sequence, int* frameCount, float* fps) {
+    LogMessage("LOG LoadExtractedFrames called");
+    printf("=== LOADING EXTRACTED FRAMES ===\n");
+    
+    pthread_mutex_lock(&gVideoProcessor.mutex);
+    
+    printf("LoadExtractedFrames: checking state - completed=%d, hasError=%d, processing=%d, frameCount=%d\n", 
+           gVideoProcessor.isCompleted, gVideoProcessor.hasError, gVideoProcessor.isProcessing, gVideoProcessor.frameCount);
+    
+    if (gVideoProcessor.isProcessing) {
+        printf("LoadExtractedFrames: still processing, waiting...\n");
+        LogMessage("LOG LoadExtractedFrames - still processing");
+        pthread_mutex_unlock(&gVideoProcessor.mutex);
+        return false;
+    }
+    
+    if (!gVideoProcessor.isCompleted || gVideoProcessor.hasError) {
+        printf("LoadExtractedFrames failed: completed=%d, hasError=%d, error='%s'\n", 
+               gVideoProcessor.isCompleted, gVideoProcessor.hasError, gVideoProcessor.errorMessage);
+        LogMessage("LOG LoadExtractedFrames failed - not completed or has error");
+        pthread_mutex_unlock(&gVideoProcessor.mutex);
+        return false;
+    }
+    
+    int totalFrames = gVideoProcessor.frameCount;
+    *fps = gVideoProcessor.fps;
+    pthread_mutex_unlock(&gVideoProcessor.mutex);
+    
+    printf("Attempting to load %d frames\n", totalFrames);
+    LogMessage("LOG Attempting to load frames");
+    
+    if (totalFrames <= 0) {
+        LogMessage("LOG No frames to load");
+        return false;
+    }
+    
+    // Allouer la mémoire pour les frames
+    *sequence = (Image*)malloc(sizeof(Image) * totalFrames);
+    if (*sequence == NULL) {
+        LogMessage("LOG Failed to allocate memory for frames");
+        return false;
+    }
+    
+    LogMessage("LOG Memory allocated for frames");
+    
+    // Charger chaque frame
+    int loadedFrames = 0;
+    int failedFrames = 0;
+    for (int i = 1; i <= totalFrames; i++) {
+        char framePath[1024];
+        snprintf(framePath, sizeof(framePath), "%sframe_%06d.png", gVideoProcessor.outputDir, i);
+        
+        if (access(framePath, F_OK) == 0) {
+            // Vérifier la taille du fichier avant de le charger
+            FILE* testFile = fopen(framePath, "rb");
+            if (testFile) {
+                fseek(testFile, 0, SEEK_END);
+                long fileSize = ftell(testFile);
+                fclose(testFile);
+                
+                if (fileSize > 100) { // Fichier doit avoir au moins 100 bytes
+                    (*sequence)[loadedFrames] = LoadImage(framePath);
+                    if ((*sequence)[loadedFrames].data != NULL) {
+                        loadedFrames++;
+                        if (loadedFrames == 1) {
+                            LogMessage("LOG First frame loaded successfully");
+                        }
+                    } else {
+                        printf("Failed to load frame %d (LoadImage failed)\n", i);
+                        LogMessage("LOG Failed to load frame data");
+                        failedFrames++;
+                    }
+                } else {
+                    printf("Frame %d is too small (%ld bytes), skipping\n", i, fileSize);
+                    LogMessage("LOG Frame file too small");
+                    failedFrames++;
+                }
+            } else {
+                printf("Cannot open frame file %d for size check\n", i);
+                LogMessage("LOG Cannot open frame file");
+                failedFrames++;
+            }
+        } else {
+            printf("Frame file %s does not exist\n", framePath);
+            LogMessage("LOG Frame file does not exist");
+            failedFrames++;
+        }
+        
+        // Log du progrès tous les 100 frames
+        if (i % 100 == 0) {
+            printf("Loaded %d/%d frames (%d failed)\n", loadedFrames, i, failedFrames);
+            LogMessage("LOG Loading progress update");
+        }
+    }
+    
+    *frameCount = loadedFrames;
+    printf("Total frames loaded: %d/%d (%d failed)\n", loadedFrames, totalFrames, failedFrames);
+    LogMessage("LOG Frame loading completed");
+    
+    if (loadedFrames == 0) {
+        free(*sequence);
+        *sequence = NULL;
+        LogMessage("LOG No frames loaded - cleaning up");
+        return false;
+    }
+    
+    // Considérer comme réussi si au moins 50% des frames ont été chargées
+    if (loadedFrames < totalFrames / 2) {
+        printf("Warning: Only loaded %d/%d frames (%.1f%%)\n", 
+               loadedFrames, totalFrames, (float)loadedFrames / totalFrames * 100.0f);
+        LogMessage("LOG Low frame load success rate");
+    }
+    
+    LogMessage("LOG LoadExtractedFrames returning true");
+    return true;
+}
+
+// Fonction pour obtenir le statut du traitement vidéo
+void GetVideoProcessingStatus(bool* isProcessing, bool* isCompleted, bool* hasError, char* errorMsg) {
+    pthread_mutex_lock(&gVideoProcessor.mutex);
+    *isProcessing = gVideoProcessor.isProcessing;
+    *isCompleted = gVideoProcessor.isCompleted;
+    *hasError = gVideoProcessor.hasError;
+    
+    if (errorMsg && gVideoProcessor.hasError) {
+        strcpy(errorMsg, gVideoProcessor.errorMessage);
+    }
+    
+    // Debug: afficher le statut détaillé
+    static int statusCallCount = 0;
+    statusCallCount++;
+    if (statusCallCount % 60 == 0) { // Afficher toutes les 60 vérifications (1 seconde)
+        printf("GetVideoProcessingStatus #%d: processing=%d, completed=%d, hasError=%d, ffmpegFinished=%d\n", 
+               statusCallCount, *isProcessing, *isCompleted, *hasError, gVideoProcessor.ffmpegFinished);
+    }
+    
+    pthread_mutex_unlock(&gVideoProcessor.mutex);
+}
+
+// Fonction pour nettoyer le processeur vidéo
+void CleanupVideoProcessor(void) {
+    printf("Cleaning up video processor...\n");
+    
+    pthread_mutex_lock(&gVideoProcessor.mutex);
+    if (gVideoProcessor.isProcessing) {
+        printf("Waiting for video processing thread to finish...\n");
+        pthread_mutex_unlock(&gVideoProcessor.mutex);
+        pthread_join(gVideoProcessor.thread, NULL);
+        printf("Video processing thread joined\n");
+    } else {
+        pthread_mutex_unlock(&gVideoProcessor.mutex);
+    }
+    
+    CleanupTempFrames();
+    pthread_mutex_destroy(&gVideoProcessor.mutex);
+    pthread_cond_destroy(&gVideoProcessor.condition);
+    printf("Video processor cleanup completed\n");
 }
 
 
@@ -165,6 +540,10 @@ int main(void)
 {
     InitLogger();
     LogMessage("LOG Program Start");
+    
+    // Initialiser le processeur vidéo
+    InitVideoProcessor();
+    LogMessage("LOG Video processor initialized");
     
     const int screenWidth = 1280;
     const int screenHeight = 720;
@@ -196,6 +575,12 @@ int main(void)
     Image* frameSequence = NULL;
     char loadedFilePath[512] = {0};
     
+    // Variables pour le traitement vidéo
+    bool isProcessingVideo = false;
+    bool videoProcessingCompleted = false;
+    bool videoProcessingError = false;
+    char videoErrorMessage[256] = {0};
+    
     // Variables pour les contrôles UI
     Rectangle playPauseButton = {10, 400, 80, 30};
     Rectangle prevButton = {100, 400, 40, 30};
@@ -216,7 +601,6 @@ int main(void)
 
     while (!WindowShouldClose())
     {
-        LogMessage("LOG Update Frame");
         
         // Vérifier modification toutes les 60 frames
         static int frameCounter = 0;
@@ -305,10 +689,26 @@ int main(void)
                 {
                     LogMessage("LOG Video file detected");
                     
-                    // Note: Raylib ne supporte pas nativement les vidéos
-                    // On pourrait utiliser une bibliothèque externe comme FFmpeg
-                    // Pour l'instant, on affiche juste un message d'erreur
-                    LogMessage("LOG Video files not yet supported");
+                    // Nettoyer les données précédentes
+                    if (originalImageTex.id > 0) UnloadTexture(originalImageTex);
+                    if (frameSequence != NULL) {
+                        for (int i = 0; i < totalFrames; i++) {
+                            UnloadImage(frameSequence[i]);
+                        }
+                        free(frameSequence);
+                        frameSequence = NULL;
+                    }
+                    
+                    // Démarrer le traitement vidéo
+                    if (StartVideoProcessing(files.paths[0])) {
+                        strcpy(loadedFilePath, files.paths[0]);
+                        isProcessingVideo = true;
+                        videoProcessingCompleted = false;
+                        videoProcessingError = false;
+                        LogMessage("LOG Video processing started");
+                    } else {
+                        LogMessage("LOG Failed to start video processing");
+                    }
                 }
                 else
                 {
@@ -321,7 +721,6 @@ int main(void)
         frameCounter++;
         if (frameCounter >= 60)
         {
-            LogMessage("LOG Update Shader");
             frameCounter = 0;
             time_t modTime = My_GetFileModTime(shaderPath);
             if (modTime != lastModTime)
@@ -353,6 +752,87 @@ int main(void)
             }
         }
         wasSpacePressed = spacePressed;
+
+        // Vérifier le statut du traitement vidéo
+        if (isProcessingVideo) {
+            printf("Checking video processing status...\n");
+            GetVideoProcessingStatus(&isProcessingVideo, &videoProcessingCompleted, 
+                                   &videoProcessingError, videoErrorMessage);
+            
+            printf("Status check: isProcessingVideo=%d, completed=%d, error=%d\n", 
+                   isProcessingVideo, videoProcessingCompleted, videoProcessingError);
+            
+            if (videoProcessingCompleted && !videoProcessingError) {
+                LogMessage("LOG Video processing completed - attempting to load frames");
+                printf("*** VIDEO PROCESSING COMPLETED - LOADING FRAMES ***\n");
+                
+                // Charger les frames extraites (une seule fois)
+                if (LoadExtractedFrames(&frameSequence, &totalFrames, &frameRate)) {
+                    LogMessage("LOG LoadExtractedFrames succeeded - setting up sequence");
+                    printf("*** FRAMES LOADED SUCCESSFULLY: %d frames at %.2f FPS ***\n", 
+                           totalFrames, frameRate);
+                    
+                    isSequence = true;
+                    currentFrame = 0;
+                    frameTime = 0.0f;
+                    sliderValue = 0.0f;
+                    
+                    // Charger la première frame
+                    if (frameSequence != NULL && totalFrames > 0) {
+                        originalImageTex = LoadTextureFromImage(frameSequence[0]);
+                        
+                        LogMessage("LOG First frame texture loaded");
+                        printf("*** FIRST FRAME TEXTURE LOADED: %dx%d ***\n", 
+                               originalImageTex.width, originalImageTex.height);
+                        
+                        // Calculer les dimensions pour adapter l'image à la fenêtre
+                        float availableWidth = screenWidth - 200;
+                        float availableHeight = screenHeight;
+                        
+                        float scaleX = availableWidth / originalImageTex.width;
+                        float scaleY = availableHeight / originalImageTex.height;
+                        float scale = fminf(scaleX, scaleY);
+                        
+                        imageScale.x = scale;
+                        imageScale.y = scale;
+                        
+                        float scaledWidth = originalImageTex.width * scale;
+                        float scaledHeight = originalImageTex.height * scale;
+                        
+                        imageRect.x = 200 + (availableWidth - scaledWidth) / 2;
+                        imageRect.y = (availableHeight - scaledHeight) / 2;
+                        imageRect.width = scaledWidth;
+                        imageRect.height = scaledHeight;
+                        
+                        sourceRect.x = 0;
+                        sourceRect.y = 0;
+                        sourceRect.width = originalImageTex.width;
+                        sourceRect.height = originalImageTex.height;
+                        
+                        printf("*** VIDEO READY FOR PLAYBACK - Image rect: %.0f,%.0f %.0fx%.0f ***\n", 
+                               imageRect.x, imageRect.y, imageRect.width, imageRect.height);
+                    }
+                    
+                    LogMessage("LOG Video frames loaded successfully");
+                } else {
+                    LogMessage("LOG Failed to load video frames");
+                    printf("ERROR: Failed to load video frames\n");
+                    videoProcessingError = true;
+                    strcpy(videoErrorMessage, "Impossible de charger les frames");
+                }
+                
+                // Réinitialiser les flags pour éviter les appels répétés
+                videoProcessingCompleted = false;
+                isProcessingVideo = false;
+            } else if (videoProcessingError) {
+                LogMessage("LOG Video processing failed");
+                printf("ERROR: Video processing failed: %s\n", videoErrorMessage);
+                isProcessingVideo = false;
+            } else if (!isProcessingVideo) {
+                printf("Processing finished but no completion flag set\n");
+                isProcessingVideo = false;
+            }
+        }
 
         // Mise à jour des séquences/animations
         if (isSequence && isPlaying) {
@@ -462,6 +942,15 @@ int main(void)
             if (mouseLocked) {
                 DrawText("SOURIS BLOQUÉE", 10, textHeight+=25, 12, RED);
                 DrawText(TextFormat("Pos: %.0f,%.0f", lockedMouseInImage.x, lockedMouseInImage.y), 10, textHeight+=15, 10, RED);
+            }
+            
+            // Affichage du statut de traitement vidéo
+            if (isProcessingVideo) {
+                DrawText("TRAITEMENT VIDÉO...", 10, textHeight+=25, 12, ORANGE);
+                DrawText("Veuillez patienter", 10, textHeight+=15, 10, ORANGE);
+            } else if (videoProcessingError) {
+                DrawText("ERREUR VIDÉO:", 10, textHeight+=25, 12, RED);
+                DrawText(videoErrorMessage, 10, textHeight+=15, 10, RED);
             }
             
             // Contrôles de lecture pour les séquences
@@ -615,7 +1104,8 @@ int main(void)
                 DrawText("Glissez une image/vidéo ici", 250, 300, 20, DARKGRAY);
                 DrawText("Formats supportés:", 250, 330, 16, GRAY);
                 DrawText("Images: PNG, JPG, BMP, TGA, GIF, HDR, PIC, PSD", 250, 350, 14, GRAY);
-                DrawText("Vidéos: MP4, MOV, AVI, MKV, WEBM (bientôt)", 250, 370, 14, GRAY);
+                DrawText("Vidéos: MP4, MOV, AVI, MKV, WEBM", 250, 370, 14, GRAY);
+                DrawText("(Nécessite FFmpeg installé)", 250, 390, 12, GRAY);
                 DrawText("Zone d'affichage:", 210, 50, 16, GRAY);
                 Rectangle dropZone = {200, 0, screenWidth - 200, screenHeight};
                 DrawRectangleLinesEx(dropZone, 2, LIGHTGRAY);
@@ -625,6 +1115,11 @@ int main(void)
     }
 
     LogMessage("LOG Program ending - cleaning up");
+    
+    // Nettoyer le processeur vidéo
+    CleanupVideoProcessor();
+    LogMessage("LOG Video processor cleaned up");
+    
     if (originalImageTex.id > 0) UnloadTexture(originalImageTex);
     
     // Nettoyer les séquences d'images

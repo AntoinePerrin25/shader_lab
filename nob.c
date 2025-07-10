@@ -15,7 +15,7 @@ int main(int argc, char **argv) {
     nob_cmd_append(&cmd, "-O2");
     nob_cmd_append(&cmd, "src/main.c");
     nob_cmd_append(&cmd, "-lraylib", "-lopengl32", "-lgdi32", "-lwinmm");
-    nob_cmd_append(&cmd, "-mwindows");
+    //nob_cmd_append(&cmd, "-mwindows");
     if (!nob_cmd_run_sync(cmd)) return 1;
    
     return 0;
