@@ -1,4 +1,4 @@
-#version 330
+#version 460
 
 in vec2 fragTexCoord;
 out vec4 fragColor;
@@ -6,7 +6,9 @@ out vec4 fragColor;
 uniform sampler2D texture0;
 uniform vec2 mousePos;
 uniform float radius;
+uniform float power;
 uniform vec2 resolution;
+uniform float time;
 
 void main() {
     vec2 uv = fragTexCoord;
@@ -19,7 +21,9 @@ void main() {
     vec4 originalColor = texture(texture0, uv);
     
     if (dist < radius) {
-       fragColor = vec4(1.0-originalColor.rgb, originalColor.a);
+       // Animation de couleur basée sur le temps et la distance
+       float animatedBlue = 0.5 + 0.3 * cos(time * 2.0 + dist * 0.1);
+       fragColor = vec4(0.6 - originalColor.rg, animatedBlue, originalColor.a);
     }
     else if (dist <= min(radius*1.05, radius+5.0))
     {

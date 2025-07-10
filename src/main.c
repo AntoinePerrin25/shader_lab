@@ -1055,7 +1055,7 @@ int main(void)
             // Draw image with shader if needed
             if (originalImageTex.id > 0)
             {
-                LogMessage("LOG Drawing image");
+                LogMessage("LOG Drawing imagef");
                 
                 if (applyShader)
                 {
@@ -1072,12 +1072,27 @@ int main(void)
                     mouseInImage.x = fmaxf(0, fminf(mouseInImage.x, originalImageTex.width));
                     mouseInImage.y = fmaxf(0, fminf(mouseInImage.y, originalImageTex.height));
 
-                    // Obtenir le temps en millisecondes depuis le lancement du programme
-                    float timeMs = (float)GetTime() * 1000.0f;
-                    SetShaderValue(shader, GetShaderLocation(shader, "timeMs"), &timeMs, SHADER_UNIFORM_FLOAT);
-
+                    // Obtenir le temps en secondes depuis le lancement du programme
+                    float timeSeconds = (float)GetTime();
+                    
+                    // Debug: afficher le temps toutes les 120 frames (2 secondes)
+                    static int timeDebugCounter = 0;
+                    timeDebugCounter++;
+                    if (timeDebugCounter % 120 == 0) {
+                        printf("Shader time: %.2f seconds\n", timeSeconds);
+                    }
+                    
                     // Appliquer le shader directement lors de l'affichage
                     BeginShaderMode(shader);
+                        // Envoyer toutes les variables uniform au shader
+                        int timeLocation = GetShaderLocation(shader, "time");
+                        if (timeLocation != -1) {
+                            SetShaderValue(shader, timeLocation, &timeSeconds, SHADER_UNIFORM_FLOAT);
+                        } else {
+                            if (timeDebugCounter % 300 == 0) { // Toutes les 5 secondes
+                                printf("WARNING: Shader uniform 'time' not found\n");
+                            }
+                        }
                         SetShaderValue(shader, GetShaderLocation(shader, "mousePos"), 
                                      (float[2]){mouseInImage.x, mouseInImage.y}, SHADER_UNIFORM_VEC2);
                         SetShaderValue(shader, GetShaderLocation(shader, "radius"), &radius, SHADER_UNIFORM_FLOAT);
