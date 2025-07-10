@@ -545,7 +545,7 @@ int main(void)
     InitVideoProcessor();
     LogMessage("LOG Video processor initialized");
     
-    const int screenWidth = 1280;
+    const int screenWidth = 1080;
     const int screenHeight = 720;
     InitWindow(screenWidth, screenHeight, "Drag & Drop + Shader Zone");
     LogMessage("LOG Window Initialized");
