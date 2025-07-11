@@ -102,6 +102,19 @@ typedef struct {
     bool isDefaultShader;
 } ShaderState;
 
+// Structure pour gérer les shaders disponibles
+#define MAX_SHADERS 32
+#define MAX_SHADER_NAME 64
+typedef struct {
+    char names[MAX_SHADERS][MAX_SHADER_NAME];
+    char paths[MAX_SHADERS][320];
+    int count;
+    int selectedIndex;
+    bool dropdownActive;
+} ShaderManager;
+
+static ShaderManager gShaderManager = {0};
+
 // Shader par défaut simple qui ne fait rien
 const char* defaultFragmentShader = 
 "#version 460\n"
@@ -151,6 +164,95 @@ Shader LoadShaderSafe(const char* vsFileName, const char* fsFileName, ShaderStat
     }
     
     return shader;
+}
+
+// Fonction pour découvrir les shaders disponibles
+void DiscoverShaders(void) {
+    printf("=== DISCOVERING SHADERS ===\n");
+    
+    gShaderManager.count = 0;
+    gShaderManager.selectedIndex = 0;
+    gShaderManager.dropdownActive = false;
+    
+    // Chercher dans le dossier racine
+    DIR* dir = opendir(".");
+    if (dir) {
+        struct dirent* entry;
+        while ((entry = readdir(dir)) != NULL && gShaderManager.count < MAX_SHADERS) {
+            if (strstr(entry->d_name, ".glsl") && entry->d_name[0] != '.') {
+                // Extraire le nom sans extension
+                char nameWithoutExt[MAX_SHADER_NAME];
+                int copyLen = snprintf(nameWithoutExt, sizeof(nameWithoutExt), "%s", entry->d_name);
+                if (copyLen >= MAX_SHADER_NAME) {
+                    printf("Warning: shader name too long, truncated: %s\n", entry->d_name);
+                    continue; // Ignorer ce shader si le nom est trop long
+                }
+                
+                char* dotPos = strrchr(nameWithoutExt, '.');
+                if (dotPos) *dotPos = '\0';
+                
+                // Ajouter au manager
+                snprintf(gShaderManager.names[gShaderManager.count], MAX_SHADER_NAME, "%s", nameWithoutExt);
+                snprintf(gShaderManager.paths[gShaderManager.count], 320, "%s", entry->d_name);
+                
+                printf("Found shader: %s -> %s\n", nameWithoutExt, entry->d_name);
+                gShaderManager.count++;
+            }
+        }
+        closedir(dir);
+    }
+    
+    // Chercher dans un dossier "shaders" s'il existe
+    DIR* shaderDir = opendir("shaders");
+    if (shaderDir) {
+        struct dirent* entry;
+        while ((entry = readdir(shaderDir)) != NULL && gShaderManager.count < MAX_SHADERS) {
+            if (strstr(entry->d_name, ".glsl") && entry->d_name[0] != '.') {
+                // Extraire le nom sans extension
+                char nameWithoutExt[MAX_SHADER_NAME];
+                int copyLen = snprintf(nameWithoutExt, sizeof(nameWithoutExt), "%s", entry->d_name);
+                if (copyLen >= MAX_SHADER_NAME) {
+                    printf("Warning: shader name too long, truncated: %s\n", entry->d_name);
+                    continue; // Ignorer ce shader si le nom est trop long
+                }
+                
+                char* dotPos = strrchr(nameWithoutExt, '.');
+                if (dotPos) *dotPos = '\0';
+                
+                // Ajouter au manager avec le chemin du dossier
+                snprintf(gShaderManager.names[gShaderManager.count], MAX_SHADER_NAME, "%s", nameWithoutExt);
+                
+                // Construire le chemin avec vérification de la longueur
+                int pathLen = snprintf(gShaderManager.paths[gShaderManager.count], 256, "shaders/%s", entry->d_name);
+                if (pathLen >= 256) {
+                    printf("Warning: shader path too long, truncated: %s\n", entry->d_name);
+                    continue; // Ignorer ce shader si le chemin est trop long
+                }
+                
+                printf("Found shader: %s -> %s\n", nameWithoutExt, gShaderManager.paths[gShaderManager.count]);
+                gShaderManager.count++;
+            }
+        }
+        closedir(shaderDir);
+    }
+    
+    printf("Total shaders found: %d\n", gShaderManager.count);
+    
+    // Si aucun shader trouvé, ajouter un shader par défaut
+    if (gShaderManager.count == 0) {
+        snprintf(gShaderManager.names[0], MAX_SHADER_NAME, "Default");
+        snprintf(gShaderManager.paths[0], 256, "effect.glsl");
+        gShaderManager.count = 1;
+        printf("No shaders found, using default\n");
+    }
+}
+
+// Fonction pour obtenir le chemin du shader sélectionné
+const char* GetSelectedShaderPath(void) {
+    if (gShaderManager.selectedIndex >= 0 && gShaderManager.selectedIndex < gShaderManager.count) {
+        return gShaderManager.paths[gShaderManager.selectedIndex];
+    }
+    return "effect.glsl"; // Fallback
 }
 time_t My_GetFileModTime(const char *path)
 {
@@ -695,7 +797,11 @@ int main(void)
     InitWindow(screenWidth, screenHeight, "Drag & Drop + Shader Zone");
     LogMessage("LOG Window Initialized");
 
-    const char *shaderPath = "effect.fs";
+    // Découvrir les shaders disponibles
+    DiscoverShaders();
+    LogMessage("LOG Shaders discovered");
+
+    const char *shaderPath = GetSelectedShaderPath();
     ShaderState shaderState = {0};
     Shader shader = LoadShaderSafe(0, shaderPath, &shaderState);
     LogMessage("LOG Shader loaded with error checking");
@@ -723,7 +829,7 @@ int main(void)
     char loadedFilePath[512] = {0};
     
     // Variables pour le traitement vidéo (simplifiées pour le mode synchrone)
-    char videoErrorMessage[256] = {0};
+    // char videoErrorMessage[256] = {0}; // Removed - unused variable
     
     // Variables pour les contrôles UI
     Rectangle playPauseButton = {10, 550, 80, 30};
@@ -733,6 +839,11 @@ int main(void)
     Rectangle reloadButton = {10, 620, 80, 30};
     Rectangle loadAllButton = {100, 620, 90, 30};
     float sliderValue = 0.0f;
+    
+    // Variables pour le dropdown des shaders
+    Rectangle shaderDropdown = {10, 50, 180, 25};
+    Rectangle shaderReloadButton = {10, 80, 100, 25};
+    Rectangle shaderDropdownList = {10, 75, 180, 200}; // Position de la liste déroulante
 
     // Variables pour le système de verrouillage de la souris
     bool mouseLocked = false;
@@ -920,12 +1031,13 @@ int main(void)
         if (frameCounter >= 60)
         {
             frameCounter = 0;
-            time_t modTime = My_GetFileModTime(shaderPath);
+            const char* currentShaderPath = GetSelectedShaderPath();
+            time_t modTime = My_GetFileModTime(currentShaderPath);
             if (modTime != lastModTime)
             {
                 lastModTime = modTime;
                 UnloadShader(shader);
-                shader = LoadShaderSafe(0, shaderPath, &shaderState);
+                shader = LoadShaderSafe(0, currentShaderPath, &shaderState);
                 LogMessage("LOG Shader reloaded due to file modification");
                 TraceLog(LOG_INFO, "Shader reloaded due to file modification.");
             }
@@ -1024,6 +1136,11 @@ int main(void)
         
         // Vérifier si la souris est sur un bouton UI
         bool mouseOnUI = false;
+        // Toujours vérifier les boutons de shader
+        bool mouseOnShaderUI = CheckCollisionPointRec(mouse, shaderDropdown) ||
+                              CheckCollisionPointRec(mouse, shaderReloadButton) ||
+                              (gShaderManager.dropdownActive && CheckCollisionPointRec(mouse, shaderDropdownList));
+        
         if (isSequence) {
             mouseOnUI = CheckCollisionPointRec(mouse, playPauseButton) ||
                        CheckCollisionPointRec(mouse, prevButton) ||
@@ -1032,6 +1149,9 @@ int main(void)
                        CheckCollisionPointRec(mouse, reloadButton) ||
                        CheckCollisionPointRec(mouse, loadAllButton);
         }
+        
+        // Combiner tous les UI
+        mouseOnUI = mouseOnUI || mouseOnShaderUI;
         
         if (mouseLocked) {
             // Si la souris est verrouillée, appliquer le shader en permanence à la position verrouillée
@@ -1058,6 +1178,60 @@ int main(void)
             unsigned int textHeight = 10; 
             // Draw panel
             DrawRectangleRec(panel, LIGHTGRAY);
+            
+            // Sélecteur de shader en haut du panel
+            Vector2 mousePos = GetMousePosition();
+            DrawText("Shader:", 10, 15, 14, BLACK);
+            
+            // Dropdown des shaders
+            Color dropdownColor = DARKGRAY;
+            if (CheckCollisionPointRec(mousePos, shaderDropdown)) {
+                dropdownColor = ColorBrightness(dropdownColor, 0.3f);
+            }
+            DrawRectangleRec(shaderDropdown, dropdownColor);
+            DrawRectangleLinesEx(shaderDropdown, 2, BLACK);
+            
+            // Texte du shader sélectionné
+            const char* selectedShaderName = "Default";
+            if (gShaderManager.selectedIndex >= 0 && gShaderManager.selectedIndex < gShaderManager.count) {
+                selectedShaderName = gShaderManager.names[gShaderManager.selectedIndex];
+            }
+            DrawText(selectedShaderName, shaderDropdown.x + 5, shaderDropdown.y + 5, 12, BLACK);
+            DrawText("v", shaderDropdown.x + shaderDropdown.width - 15, shaderDropdown.y + 5, 12, BLACK);
+            
+            // Bouton reload des shaders
+            Color reloadShaderColor = SKYBLUE;
+            if (CheckCollisionPointRec(mousePos, shaderReloadButton)) {
+                reloadShaderColor = ColorBrightness(reloadShaderColor, 0.2f);
+            }
+            DrawRectangleRec(shaderReloadButton, reloadShaderColor);
+            DrawRectangleLinesEx(shaderReloadButton, 2, BLACK);
+            DrawText("Reload Shaders", shaderReloadButton.x + 5, shaderReloadButton.y + 5, 10, BLACK);
+            
+            // Liste déroulante des shaders si active
+            if (gShaderManager.dropdownActive) {
+                float itemHeight = 20;
+                float maxHeight = fminf(gShaderManager.count * itemHeight, shaderDropdownList.height);
+                Rectangle listRect = {shaderDropdownList.x, shaderDropdownList.y, shaderDropdownList.width, maxHeight};
+                
+                DrawRectangleRec(listRect, LIGHTGRAY);
+                DrawRectangleLinesEx(listRect, 2, BLACK);
+                
+                for (int i = 0; i < gShaderManager.count; i++) {
+                    Rectangle itemRect = {listRect.x, listRect.y + i * itemHeight, listRect.width, itemHeight};
+                    
+                    Color itemColor = (i == gShaderManager.selectedIndex) ? BLUE : LIGHTGRAY;
+                    if (CheckCollisionPointRec(mousePos, itemRect)) {
+                        itemColor = ColorBrightness(itemColor, 0.2f);
+                    }
+                    
+                    DrawRectangleRec(itemRect, itemColor);
+                    DrawRectangleLinesEx(itemRect, 1, DARKGRAY);
+                    DrawText(gShaderManager.names[i], itemRect.x + 5, itemRect.y + 2, 12, BLACK);
+                }
+            }
+            textHeight += 100;
+            //unsigned int textHeight = 110; // Décaler le texte après les contrôles shader
             DrawText("Contrôles:", 10, textHeight+=25, 16, BLACK);
             DrawText("Rayon : Haut/Bas", 10, textHeight+=25, 14, BLACK);
             DrawText(TextFormat("Rayon: %.0f", radius), 10, textHeight+=25, 14, BLACK);
@@ -1332,6 +1506,56 @@ int main(void)
                     printf("Force loading all available frames...\n");
                     LoadAllAvailableFrames(&frameSequence, &videoTextureBuffer, &totalFrames);
                     LogMessage("LOG All frames loaded");
+                }
+            }
+
+            // Gestion des clics sur le dropdown des shaders
+            if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
+                Vector2 mousePos = GetMousePosition();
+                
+                // Clic sur le dropdown principal
+                if (CheckCollisionPointRec(mousePos, shaderDropdown)) {
+                    gShaderManager.dropdownActive = !gShaderManager.dropdownActive;
+                    LogMessage("LOG Shader dropdown toggled");
+                }
+                // Clic sur le bouton reload des shaders
+                else if (CheckCollisionPointRec(mousePos, shaderReloadButton)) {
+                    printf("Reloading shader list...\n");
+                    DiscoverShaders();
+                    
+                    // Recharger le shader actuel
+                    const char* currentShaderPath = GetSelectedShaderPath();
+                    UnloadShader(shader);
+                    shader = LoadShaderSafe(0, currentShaderPath, &shaderState);
+                    lastModTime = My_GetFileModTime(currentShaderPath);
+                    
+                    printf("Shader list reloaded, found %d shaders\n", gShaderManager.count);
+                    LogMessage("LOG Shader list reloaded");
+                }
+                // Clic sur un item de la liste déroulante
+                else if (gShaderManager.dropdownActive && CheckCollisionPointRec(mousePos, shaderDropdownList)) {
+                    float itemHeight = 20;
+                    int clickedIndex = (int)((mousePos.y - shaderDropdownList.y) / itemHeight);
+                    
+                    if (clickedIndex >= 0 && clickedIndex < gShaderManager.count) {
+                        gShaderManager.selectedIndex = clickedIndex;
+                        gShaderManager.dropdownActive = false;
+                        
+                        // Charger le nouveau shader
+                        const char* newShaderPath = GetSelectedShaderPath();
+                        printf("Switching to shader: %s\n", newShaderPath);
+                        
+                        UnloadShader(shader);
+                        shader = LoadShaderSafe(0, newShaderPath, &shaderState);
+                        lastModTime = My_GetFileModTime(newShaderPath);
+                        
+                        LogMessage("LOG Shader switched");
+                    }
+                }
+                // Clic ailleurs ferme la liste déroulante
+                else if (gShaderManager.dropdownActive) {
+                    gShaderManager.dropdownActive = false;
+                    LogMessage("LOG Shader dropdown closed");
                 }
             }
 
