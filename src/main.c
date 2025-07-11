@@ -375,7 +375,45 @@ bool StartVideoProcessing(const char* videoPath) {
     return true;
 }
 
-// Fonction pour charger les frames extraites
+// Fonction pour vérifier si une frame spécifique est disponible
+bool IsFrameAvailable(int frameIndex) {
+    if (frameIndex < 0) return false;
+    
+    char framePath[1024];
+    snprintf(framePath, sizeof(framePath), "%sframe_%06d.png", gVideoProcessor.outputDir, frameIndex + 1);
+    
+    if (access(framePath, F_OK) != 0) {
+        return false;
+    }
+    
+    // Vérifier la taille du fichier
+    FILE* testFile = fopen(framePath, "rb");
+    if (testFile) {
+        fseek(testFile, 0, SEEK_END);
+        long fileSize = ftell(testFile);
+        fclose(testFile);
+        return fileSize > 100; // Fichier doit avoir au moins 100 bytes
+    }
+    
+    return false;
+}
+
+// Fonction pour charger une frame spécifique à la demande
+bool LoadSpecificFrame(int frameIndex, Image* frameImage) {
+    if (frameIndex < 0) return false;
+    
+    char framePath[1024];
+    snprintf(framePath, sizeof(framePath), "%sframe_%06d.png", gVideoProcessor.outputDir, frameIndex + 1);
+    
+    if (!IsFrameAvailable(frameIndex)) {
+        return false;
+    }
+    
+    *frameImage = LoadImage(framePath);
+    return frameImage->data != NULL;
+}
+
+// Fonction pour charger les frames extraites avec chargement progressif
 bool LoadExtractedFrames(Image** sequence, int* frameCount, float* fps) {
     LogMessage("LOG LoadExtractedFrames called");
     printf("=== LOADING EXTRACTED FRAMES ===\n");
@@ -385,35 +423,38 @@ bool LoadExtractedFrames(Image** sequence, int* frameCount, float* fps) {
     printf("LoadExtractedFrames: checking state - completed=%d, hasError=%d, processing=%d, frameCount=%d\n", 
            gVideoProcessor.isCompleted, gVideoProcessor.hasError, gVideoProcessor.isProcessing, gVideoProcessor.frameCount);
     
-    if (gVideoProcessor.isProcessing) {
-        printf("LoadExtractedFrames: still processing, waiting...\n");
-        LogMessage("LOG LoadExtractedFrames - still processing");
+    // Permettre le chargement même si le traitement n'est pas complètement terminé
+    if (gVideoProcessor.hasError) {
+        printf("LoadExtractedFrames failed: hasError=%d, error='%s'\n", 
+               gVideoProcessor.hasError, gVideoProcessor.errorMessage);
+        LogMessage("LOG LoadExtractedFrames failed - has error");
         pthread_mutex_unlock(&gVideoProcessor.mutex);
         return false;
     }
     
-    if (!gVideoProcessor.isCompleted || gVideoProcessor.hasError) {
-        printf("LoadExtractedFrames failed: completed=%d, hasError=%d, error='%s'\n", 
-               gVideoProcessor.isCompleted, gVideoProcessor.hasError, gVideoProcessor.errorMessage);
-        LogMessage("LOG LoadExtractedFrames failed - not completed or has error");
-        pthread_mutex_unlock(&gVideoProcessor.mutex);
-        return false;
-    }
-    
-    int totalFrames = gVideoProcessor.frameCount;
-    *fps = gVideoProcessor.fps;
+    *fps = gVideoProcessor.fps > 0 ? gVideoProcessor.fps : 30.0f;
     pthread_mutex_unlock(&gVideoProcessor.mutex);
     
-    printf("Attempting to load %d frames\n", totalFrames);
-    LogMessage("LOG Attempting to load frames");
+    // Compter les frames actuellement disponibles
+    int availableFrames = 0;
+    for (int i = 0; i < 10000; i++) { // Limite raisonnable
+        if (IsFrameAvailable(i)) {
+            availableFrames = i + 1;
+        } else {
+            break;
+        }
+    }
     
-    if (totalFrames <= 0) {
-        LogMessage("LOG No frames to load");
+    printf("Found %d available frames\n", availableFrames);
+    LogMessage("LOG Counted available frames");
+    
+    if (availableFrames <= 0) {
+        LogMessage("LOG No frames available to load");
         return false;
     }
     
-    // Allouer la mémoire pour les frames
-    *sequence = (Image*)malloc(sizeof(Image) * totalFrames);
+    // Allouer la mémoire pour les frames (on alloue pour toutes les frames possibles)
+    *sequence = (Image*)calloc(10000, sizeof(Image)); // Utiliser calloc pour initialiser à zéro
     if (*sequence == NULL) {
         LogMessage("LOG Failed to allocate memory for frames");
         return false;
@@ -421,58 +462,24 @@ bool LoadExtractedFrames(Image** sequence, int* frameCount, float* fps) {
     
     LogMessage("LOG Memory allocated for frames");
     
-    // Charger chaque frame
+    // Charger les frames disponibles
     int loadedFrames = 0;
-    int failedFrames = 0;
-    for (int i = 1; i <= totalFrames; i++) {
-        char framePath[1024];
-        snprintf(framePath, sizeof(framePath), "%sframe_%06d.png", gVideoProcessor.outputDir, i);
-        
-        if (access(framePath, F_OK) == 0) {
-            // Vérifier la taille du fichier avant de le charger
-            FILE* testFile = fopen(framePath, "rb");
-            if (testFile) {
-                fseek(testFile, 0, SEEK_END);
-                long fileSize = ftell(testFile);
-                fclose(testFile);
-                
-                if (fileSize > 100) { // Fichier doit avoir au moins 100 bytes
-                    (*sequence)[loadedFrames] = LoadImage(framePath);
-                    if ((*sequence)[loadedFrames].data != NULL) {
-                        loadedFrames++;
-                        if (loadedFrames == 1) {
-                            LogMessage("LOG First frame loaded successfully");
-                        }
-                    } else {
-                        printf("Failed to load frame %d (LoadImage failed)\n", i);
-                        LogMessage("LOG Failed to load frame data");
-                        failedFrames++;
-                    }
-                } else {
-                    printf("Frame %d is too small (%ld bytes), skipping\n", i, fileSize);
-                    LogMessage("LOG Frame file too small");
-                    failedFrames++;
-                }
-            } else {
-                printf("Cannot open frame file %d for size check\n", i);
-                LogMessage("LOG Cannot open frame file");
-                failedFrames++;
+    for (int i = 0; i < availableFrames; i++) {
+        if (LoadSpecificFrame(i, &(*sequence)[i])) {
+            loadedFrames++;
+            if (loadedFrames == 1) {
+                LogMessage("LOG First frame loaded successfully");
+                printf("*** FIRST FRAME LOADED - READY FOR DISPLAY ***\n");
             }
         } else {
-            printf("Frame file %s does not exist\n", framePath);
-            LogMessage("LOG Frame file does not exist");
-            failedFrames++;
-        }
-        
-        // Log du progrès tous les 100 frames
-        if (i % 100 == 0) {
-            printf("Loaded %d/%d frames (%d failed)\n", loadedFrames, i, failedFrames);
-            LogMessage("LOG Loading progress update");
+            printf("Failed to load frame %d\n", i);
+            LogMessage("LOG Failed to load specific frame");
+            break; // Arrêter au premier échec pour maintenir la séquence
         }
     }
     
     *frameCount = loadedFrames;
-    printf("Total frames loaded: %d/%d (%d failed)\n", loadedFrames, totalFrames, failedFrames);
+    printf("Total frames loaded: %d\n", loadedFrames);
     LogMessage("LOG Frame loading completed");
     
     if (loadedFrames == 0) {
@@ -482,15 +489,31 @@ bool LoadExtractedFrames(Image** sequence, int* frameCount, float* fps) {
         return false;
     }
     
-    // Considérer comme réussi si au moins 50% des frames ont été chargées
-    if (loadedFrames < totalFrames / 2) {
-        printf("Warning: Only loaded %d/%d frames (%.1f%%)\n", 
-               loadedFrames, totalFrames, (float)loadedFrames / totalFrames * 100.0f);
-        LogMessage("LOG Low frame load success rate");
-    }
-    
     LogMessage("LOG LoadExtractedFrames returning true");
     return true;
+}
+
+// Fonction pour vérifier et charger de nouvelles frames pendant la lecture
+int CheckAndLoadNewFrames(Image** sequence, int currentMaxFrames) {
+    if (!sequence || !*sequence) return currentMaxFrames;
+    
+    int newMaxFrames = currentMaxFrames;
+    
+    // Vérifier les 10 frames suivantes
+    for (int i = currentMaxFrames; i < currentMaxFrames + 10; i++) {
+        if (IsFrameAvailable(i)) {
+            if (LoadSpecificFrame(i, &(*sequence)[i])) {
+                newMaxFrames = i + 1;
+                printf("New frame loaded: %d\n", i + 1);
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    
+    return newMaxFrames;
 }
 
 // Fonction pour obtenir le statut du traitement vidéo
@@ -582,10 +605,10 @@ int main(void)
     char videoErrorMessage[256] = {0};
     
     // Variables pour les contrôles UI
-    Rectangle playPauseButton = {10, 400, 80, 30};
-    Rectangle prevButton = {100, 400, 40, 30};
-    Rectangle nextButton = {150, 400, 40, 30};
-    Rectangle frameSlider = {10, 450, 180, 20};
+    Rectangle playPauseButton = {10, 550, 80, 30};
+    Rectangle prevButton = {100, 550, 40, 30};
+    Rectangle nextButton = {150, 550, 40, 30};
+    Rectangle frameSlider = {10, 590, 180, 20};
     float sliderValue = 0.0f;
 
     // Variables pour le système de verrouillage de la souris
@@ -762,144 +785,125 @@ int main(void)
             printf("Status check: isProcessingVideo=%d, completed=%d, error=%d\n", 
                    isProcessingVideo, videoProcessingCompleted, videoProcessingError);
             
-            if (videoProcessingCompleted && !videoProcessingError) {
-                LogMessage("LOG Video processing completed - attempting to load frames");
-                printf("*** VIDEO PROCESSING COMPLETED - LOADING FRAMES ***\n");
-                
-                // Charger les frames extraites (une seule fois)
-                if (LoadExtractedFrames(&frameSequence, &totalFrames, &frameRate)) {
-                    LogMessage("LOG LoadExtractedFrames succeeded - setting up sequence");
-                    printf("*** FRAMES LOADED SUCCESSFULLY: %d frames at %.2f FPS ***\n", 
-                           totalFrames, frameRate);
+            // Essayer de charger les frames dès que possible
+            if (!isSequence && !videoProcessingError) {
+                // Vérifier s'il y a des frames disponibles
+                if (IsFrameAvailable(0)) {
+                    LogMessage("LOG First frames available - attempting to load");
+                    printf("*** FIRST FRAMES AVAILABLE - LOADING ***\n");
                     
-                    isSequence = true;
-                    currentFrame = 0;
-                    frameTime = 0.0f;
-                    sliderValue = 0.0f;
-                    
-                    // Charger la première frame
-                    if (frameSequence != NULL && totalFrames > 0) {
-                        originalImageTex = LoadTextureFromImage(frameSequence[0]);
+                    if (LoadExtractedFrames(&frameSequence, &totalFrames, &frameRate)) {
+                        LogMessage("LOG Initial frames loaded - setting up sequence");
+                        printf("*** INITIAL FRAMES LOADED: %d frames at %.2f FPS ***\n", 
+                               totalFrames, frameRate);
                         
-                        LogMessage("LOG First frame texture loaded");
-                        printf("*** FIRST FRAME TEXTURE LOADED: %dx%d ***\n", 
-                               originalImageTex.width, originalImageTex.height);
+                        isSequence = true;
+                        currentFrame = 0;
+                        frameTime = 0.0f;
+                        sliderValue = 0.0f;
                         
-                        // Calculer les dimensions pour adapter l'image à la fenêtre
-                        float availableWidth = screenWidth - 200;
-                        float availableHeight = screenHeight;
+                        // Charger la première frame
+                        if (frameSequence != NULL && totalFrames > 0) {
+                            originalImageTex = LoadTextureFromImage(frameSequence[0]);
+                            
+                            LogMessage("LOG First frame texture loaded");
+                            printf("*** FIRST FRAME TEXTURE LOADED: %dx%d ***\n", 
+                                   originalImageTex.width, originalImageTex.height);
                         
-                        float scaleX = availableWidth / originalImageTex.width;
-                        float scaleY = availableHeight / originalImageTex.height;
-                        float scale = fminf(scaleX, scaleY);
-                        
-                        imageScale.x = scale;
-                        imageScale.y = scale;
-                        
-                        float scaledWidth = originalImageTex.width * scale;
-                        float scaledHeight = originalImageTex.height * scale;
-                        
-                        imageRect.x = 200 + (availableWidth - scaledWidth) / 2;
-                        imageRect.y = (availableHeight - scaledHeight) / 2;
-                        imageRect.width = scaledWidth;
-                        imageRect.height = scaledHeight;
-                        
-                        sourceRect.x = 0;
-                        sourceRect.y = 0;
-                        sourceRect.width = originalImageTex.width;
-                        sourceRect.height = originalImageTex.height;
-                        
-                        printf("*** VIDEO READY FOR PLAYBACK - Image rect: %.0f,%.0f %.0fx%.0f ***\n", 
-                               imageRect.x, imageRect.y, imageRect.width, imageRect.height);
+                            // Calculer les dimensions pour adapter l'image à la fenêtre
+                            float availableWidth = screenWidth - 200;
+                            float availableHeight = screenHeight;
+                            
+                            float scaleX = availableWidth / originalImageTex.width;
+                            float scaleY = availableHeight / originalImageTex.height;
+                            float scale = fminf(scaleX, scaleY);
+                            
+                            imageScale.x = scale;
+                            imageScale.y = scale;
+                            
+                            float scaledWidth = originalImageTex.width * scale;
+                            float scaledHeight = originalImageTex.height * scale;
+                            
+                            imageRect.x = 200 + (availableWidth - scaledWidth) / 2;
+                            imageRect.y = (availableHeight - scaledHeight) / 2;
+                            imageRect.width = scaledWidth;
+                            imageRect.height = scaledHeight;
+                            
+                            sourceRect.x = 0;
+                            sourceRect.y = 0;
+                            sourceRect.width = originalImageTex.width;
+                            sourceRect.height = originalImageTex.height;
+                            
+                            printf("*** VIDEO READY FOR PLAYBACK - Image rect: %.0f,%.0f %.0fx%.0f ***\n", 
+                                   imageRect.x, imageRect.y, imageRect.width, imageRect.height);
+                        }
                     }
-                    
-                    LogMessage("LOG Video frames loaded successfully");
-                } else {
-                    LogMessage("LOG Failed to load video frames");
-                    printf("ERROR: Failed to load video frames\n");
-                    videoProcessingError = true;
-                    strcpy(videoErrorMessage, "Impossible de charger les frames");
                 }
-                
-                // Réinitialiser les flags pour éviter les appels répétés
-                videoProcessingCompleted = false;
-                isProcessingVideo = false;
-            } else if (videoProcessingError) {
+            }
+            
+            if (videoProcessingError) {
                 LogMessage("LOG Video processing failed");
                 printf("ERROR: Video processing failed: %s\n", videoErrorMessage);
                 isProcessingVideo = false;
-            } else if (!isProcessingVideo) {
-                printf("Processing finished but no completion flag set\n");
-                isProcessingVideo = false;
+            }
+        }
+        
+        // Vérifier et charger de nouvelles frames si nécessaire
+        if (isSequence && isProcessingVideo) {
+            static int lastFrameCheck = 0;
+            if (frameCounter % 60 == 0) { // Vérifier toutes les secondes
+                int newMaxFrames = CheckAndLoadNewFrames(&frameSequence, totalFrames);
+                if (newMaxFrames > totalFrames) {
+                    totalFrames = newMaxFrames;
+                    printf("Updated total frames to: %d\n", totalFrames);
+                }
             }
         }
 
-        // Mise à jour des séquences/animations
+        // Mise à jour des séquences/animations avec gestion d'erreur
         if (isSequence && isPlaying) {
             frameTime += GetFrameTime();
             if (frameTime >= 1.0f / frameRate) {
                 frameTime = 0.0f;
-                currentFrame++;
-                if (currentFrame >= totalFrames) {
-                    currentFrame = 0; // Boucle
-                }
+                int nextFrame = currentFrame + 1;
                 
-                // Mettre à jour la texture avec la frame actuelle
-                if (frameSequence != NULL && currentFrame < totalFrames) {
+                // Vérifier si la frame suivante est disponible
+                if (nextFrame < totalFrames && frameSequence[nextFrame].data != NULL) {
+                    currentFrame = nextFrame;
+                    
+                    // Mettre à jour la texture avec la frame actuelle
                     UnloadTexture(originalImageTex);
                     originalImageTex = LoadTextureFromImage(frameSequence[currentFrame]);
+                    
+                    // Mettre à jour le slider
+                    sliderValue = totalFrames > 1 ? (float)currentFrame / (float)(totalFrames - 1) : 0.0f;
+                } else {
+                    // Frame suivante pas disponible
+                    if (nextFrame >= totalFrames) {
+                        // Fin de séquence, recommencer au début
+                        currentFrame = 0;
+                        if (frameSequence != NULL && frameSequence[0].data != NULL) {
+                            UnloadTexture(originalImageTex);
+                            originalImageTex = LoadTextureFromImage(frameSequence[currentFrame]);
+                        }
+                        sliderValue = 0.0f;
+                    } else {
+                        // Frame suivante pas encore chargée, arrêter la lecture
+                        isPlaying = false;
+                        printf("Playback paused: frame %d not ready\n", nextFrame);
+                        LogMessage("LOG Playback paused - next frame not ready");
+                        
+                        // Essayer de charger la frame manquante
+                        if (LoadSpecificFrame(nextFrame, &frameSequence[nextFrame])) {
+                            printf("Late frame %d loaded, resuming playback\n", nextFrame);
+                            isPlaying = true;
+                        }
+                    }
                 }
-                
-                // Mettre à jour le slider
-                sliderValue = (float)currentFrame / (float)(totalFrames - 1);
             }
         }
 
-        // Gestion des contrôles UI pour les séquences
-        Vector2 mousePos = GetMousePosition();
-        if (isSequence) {
-            // Bouton Play/Pause
-            if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON) && CheckCollisionPointRec(mousePos, playPauseButton)) {
-                isPlaying = !isPlaying;
-                LogMessage(isPlaying ? "LOG Playback started" : "LOG Playback paused");
-            }
-            
-            // Bouton Previous
-            if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON) && CheckCollisionPointRec(mousePos, prevButton)) {
-                currentFrame = (currentFrame - 1 + totalFrames) % totalFrames;
-                if (frameSequence != NULL) {
-                    UnloadTexture(originalImageTex);
-                    originalImageTex = LoadTextureFromImage(frameSequence[currentFrame]);
-                }
-                sliderValue = (float)currentFrame / (float)(totalFrames - 1);
-                LogMessage("LOG Previous frame");
-            }
-            
-            // Bouton Next
-            if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON) && CheckCollisionPointRec(mousePos, nextButton)) {
-                currentFrame = (currentFrame + 1) % totalFrames;
-                if (frameSequence != NULL) {
-                    UnloadTexture(originalImageTex);
-                    originalImageTex = LoadTextureFromImage(frameSequence[currentFrame]);
-                }
-                sliderValue = (float)currentFrame / (float)(totalFrames - 1);
-                LogMessage("LOG Next frame");
-            }
-            
-            // Slider de progression
-            if (IsMouseButtonDown(MOUSE_LEFT_BUTTON) && CheckCollisionPointRec(mousePos, frameSlider)) {
-                float relativeX = (mousePos.x - frameSlider.x) / frameSlider.width;
-                sliderValue = fmaxf(0.0f, fminf(1.0f, relativeX));
-                currentFrame = (int)(sliderValue * (totalFrames - 1));
-                if (frameSequence != NULL) {
-                    UnloadTexture(originalImageTex);
-                    originalImageTex = LoadTextureFromImage(frameSequence[currentFrame]);
-                }
-                LogMessage("LOG Frame selected via slider");
-            }
-        }
-
-        // Panel gauche
+        // Panel gauche (étendu pour inclure les boutons)
         Rectangle panel = {0, 0, 200, screenHeight};
 
         // Gestion clic + shader (maintenir le clic pour appliquer continuellement)
@@ -908,6 +912,15 @@ int main(void)
         
         bool applyShader = false;
         
+        // Vérifier si la souris est sur un bouton UI
+        bool mouseOnUI = false;
+        if (isSequence) {
+            mouseOnUI = CheckCollisionPointRec(mouse, playPauseButton) ||
+                       CheckCollisionPointRec(mouse, prevButton) ||
+                       CheckCollisionPointRec(mouse, nextButton) ||
+                       CheckCollisionPointRec(mouse, frameSlider);
+        }
+        
         if (mouseLocked) {
             // Si la souris est verrouillée, appliquer le shader en permanence à la position verrouillée
             applyShader = originalImageTex.id > 0;
@@ -915,6 +928,7 @@ int main(void)
             // Comportement normal : clic gauche pour appliquer le shader
             applyShader = (IsMouseButtonDown(MOUSE_LEFT_BUTTON) || IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) && 
                           !CheckCollisionPointRec(mouse, panel) && 
+                          !mouseOnUI &&
                           originalImageTex.id > 0 && 
                           CheckCollisionPointRec(mouse, imageRect);
         }
@@ -960,29 +974,22 @@ int main(void)
                 DrawText("P: Play/Pause", 10, textHeight+=15, 10, DARKGRAY);
                 DrawText("←→: Frame prec/suiv", 10, textHeight+=15, 10, DARKGRAY);
                 
-                // Bouton Play/Pause
-                DrawRectangleRec(playPauseButton, isPlaying ? GREEN : RED);
-                DrawRectangleLinesEx(playPauseButton, 2, BLACK);
-                DrawText(isPlaying ? "Pause" : "Play", playPauseButton.x + 10, playPauseButton.y + 8, 14, BLACK);
-                
-                // Boutons Previous/Next
-                DrawRectangleRec(prevButton, SKYBLUE);
-                DrawRectangleLinesEx(prevButton, 2, BLACK);
-                DrawText("<", prevButton.x + 15, prevButton.y + 8, 14, BLACK);
-                
-                DrawRectangleRec(nextButton, SKYBLUE);
-                DrawRectangleLinesEx(nextButton, 2, BLACK);
-                DrawText(">", nextButton.x + 15, nextButton.y + 8, 14, BLACK);
-                
-                // Slider de progression
-                DrawRectangleRec(frameSlider, DARKGRAY);
-                DrawRectangleLinesEx(frameSlider, 2, BLACK);
-                float sliderPos = frameSlider.x + (sliderValue * frameSlider.width);
-                DrawRectangle(sliderPos - 5, frameSlider.y - 2, 10, frameSlider.height + 4, BLUE);
+                // Afficher un avertissement si en cours de chargement
+                if (isProcessingVideo) {
+                    DrawText("CHARGEMENT...", 10, textHeight+=15, 12, ORANGE);
+                    DrawText("Frames peuvent manquer", 10, textHeight+=15, 10, ORANGE);
+                }
                 
                 // Affichage des informations de frame
-                DrawText(TextFormat("Frame: %d/%d", currentFrame + 1, totalFrames), 10, textHeight+=30, 12, BLACK);
-                DrawText(TextFormat("FPS: %.1f", frameRate), 10, textHeight+=20, 12, BLACK);
+                DrawText(TextFormat("Frame: %d/%d", currentFrame + 1, totalFrames), 10, textHeight+=20, 12, BLACK);
+                DrawText(TextFormat("FPS: %.1f", frameRate), 10, textHeight+=15, 12, BLACK);
+                
+                // Afficher le statut de chargement
+                if (isProcessingVideo) {
+                    DrawText("Chargement en cours...", 10, textHeight+=15, 10, ORANGE);
+                } else {
+                    DrawText("Chargement terminé", 10, textHeight+=15, 10, GREEN);
+                }
             }
             
             if (originalImageTex.id > 0) {
@@ -1007,6 +1014,47 @@ int main(void)
                 DrawText("dans la zone de droite", 10, textHeight+=25, 14, BLACK);
             }
 
+            // Dessiner les boutons UI en bas du panel (après tout le texte)
+            if (isSequence) {
+                Vector2 mousePos = GetMousePosition();
+                
+                // Bouton Play/Pause
+                Color playButtonColor = isPlaying ? GREEN : (isProcessingVideo ? ORANGE : RED);
+                if (CheckCollisionPointRec(mousePos, playPauseButton)) {
+                    playButtonColor = ColorBrightness(playButtonColor, 0.2f); // Éclaircir au survol
+                }
+                DrawRectangleRec(playPauseButton, playButtonColor);
+                DrawRectangleLinesEx(playPauseButton, 2, BLACK);
+                DrawText(isPlaying ? "Pause" : "Play", playPauseButton.x + 10, playPauseButton.y + 8, 14, BLACK);
+                
+                // Boutons Previous/Next
+                Color prevButtonColor = SKYBLUE;
+                if (CheckCollisionPointRec(mousePos, prevButton)) {
+                    prevButtonColor = ColorBrightness(prevButtonColor, 0.2f);
+                }
+                DrawRectangleRec(prevButton, prevButtonColor);
+                DrawRectangleLinesEx(prevButton, 2, BLACK);
+                DrawText("<", prevButton.x + 15, prevButton.y + 8, 14, BLACK);
+                
+                Color nextButtonColor = SKYBLUE;
+                if (CheckCollisionPointRec(mousePos, nextButton)) {
+                    nextButtonColor = ColorBrightness(nextButtonColor, 0.2f);
+                }
+                DrawRectangleRec(nextButton, nextButtonColor);
+                DrawRectangleLinesEx(nextButton, 2, BLACK);
+                DrawText(">", nextButton.x + 15, nextButton.y + 8, 14, BLACK);
+                
+                // Slider de progression
+                Color sliderColor = DARKGRAY;
+                if (CheckCollisionPointRec(mousePos, frameSlider)) {
+                    sliderColor = ColorBrightness(sliderColor, 0.3f);
+                }
+                DrawRectangleRec(frameSlider, sliderColor);
+                DrawRectangleLinesEx(frameSlider, 2, BLACK);
+                float sliderPos = frameSlider.x + (sliderValue * frameSlider.width);
+                DrawRectangle(sliderPos - 5, frameSlider.y - 2, 10, frameSlider.height + 4, BLUE);
+            }
+
             // Modifier rayon
             if (IsKeyDown(KEY_UP)) {
                 radius += 1.0f;
@@ -1029,26 +1077,103 @@ int main(void)
             // Contrôles clavier pour les séquences
             if (isSequence) {
                 if (IsKeyPressed(KEY_P)) {
-                    isPlaying = !isPlaying;
-                    LogMessage(isPlaying ? "LOG Playback started (keyboard)" : "LOG Playback paused (keyboard)");
+                    // Vérifier si on peut lire la frame suivante
+                    if (!isPlaying) {
+                        int nextFrame = (currentFrame + 1) % totalFrames;
+                        if (frameSequence[nextFrame].data != NULL || !isProcessingVideo) {
+                            isPlaying = true;
+                            LogMessage("LOG Playback started (keyboard)");
+                        } else {
+                            printf("Cannot start playback: next frame not ready\n");
+                        }
+                    } else {
+                        isPlaying = false;
+                        LogMessage("LOG Playback paused (keyboard)");
+                    }
                 }
                 if (IsKeyPressed(KEY_LEFT)) {
-                    currentFrame = (currentFrame - 1 + totalFrames) % totalFrames;
-                    if (frameSequence != NULL) {
+                    int prevFrame = (currentFrame - 1 + totalFrames) % totalFrames;
+                    if (frameSequence != NULL && frameSequence[prevFrame].data != NULL) {
+                        currentFrame = prevFrame;
                         UnloadTexture(originalImageTex);
                         originalImageTex = LoadTextureFromImage(frameSequence[currentFrame]);
+                        sliderValue = totalFrames > 1 ? (float)currentFrame / (float)(totalFrames - 1) : 0.0f;
+                        LogMessage("LOG Previous frame (keyboard)");
                     }
-                    sliderValue = (float)currentFrame / (float)(totalFrames - 1);
-                    LogMessage("LOG Previous frame (keyboard)");
                 }
                 if (IsKeyPressed(KEY_RIGHT)) {
-                    currentFrame = (currentFrame + 1) % totalFrames;
-                    if (frameSequence != NULL) {
+                    int nextFrame = (currentFrame + 1) % totalFrames;
+                    if (frameSequence != NULL && frameSequence[nextFrame].data != NULL) {
+                        currentFrame = nextFrame;
                         UnloadTexture(originalImageTex);
                         originalImageTex = LoadTextureFromImage(frameSequence[currentFrame]);
+                        sliderValue = totalFrames > 1 ? (float)currentFrame / (float)(totalFrames - 1) : 0.0f;
+                        LogMessage("LOG Next frame (keyboard)");
+                    } else {
+                        printf("Next frame not available yet\n");
                     }
-                    sliderValue = (float)currentFrame / (float)(totalFrames - 1);
-                    LogMessage("LOG Next frame (keyboard)");
+                }
+            }
+
+            // Gestion des clics sur les boutons UI
+            if (isSequence) {
+                Vector2 mousePos = GetMousePosition();
+                
+                // Clic sur le bouton Play/Pause
+                if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON) && CheckCollisionPointRec(mousePos, playPauseButton)) {
+                    if (!isPlaying) {
+                        int nextFrame = (currentFrame + 1) % totalFrames;
+                        if (frameSequence[nextFrame].data != NULL || !isProcessingVideo) {
+                            isPlaying = true;
+                            LogMessage("LOG Playback started (button)");
+                        } else {
+                            printf("Cannot start playback: next frame not ready\n");
+                        }
+                    } else {
+                        isPlaying = false;
+                        LogMessage("LOG Playback paused (button)");
+                    }
+                }
+                
+                // Clic sur le bouton Previous
+                if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON) && CheckCollisionPointRec(mousePos, prevButton)) {
+                    int prevFrame = (currentFrame - 1 + totalFrames) % totalFrames;
+                    if (frameSequence != NULL && frameSequence[prevFrame].data != NULL) {
+                        currentFrame = prevFrame;
+                        UnloadTexture(originalImageTex);
+                        originalImageTex = LoadTextureFromImage(frameSequence[currentFrame]);
+                        sliderValue = totalFrames > 1 ? (float)currentFrame / (float)(totalFrames - 1) : 0.0f;
+                        LogMessage("LOG Previous frame (button)");
+                    }
+                }
+                
+                // Clic sur le bouton Next
+                if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON) && CheckCollisionPointRec(mousePos, nextButton)) {
+                    int nextFrame = (currentFrame + 1) % totalFrames;
+                    if (frameSequence != NULL && frameSequence[nextFrame].data != NULL) {
+                        currentFrame = nextFrame;
+                        UnloadTexture(originalImageTex);
+                        originalImageTex = LoadTextureFromImage(frameSequence[currentFrame]);
+                        sliderValue = totalFrames > 1 ? (float)currentFrame / (float)(totalFrames - 1) : 0.0f;
+                        LogMessage("LOG Next frame (button)");
+                    } else {
+                        printf("Next frame not available yet\n");
+                    }
+                }
+                
+                // Gestion du slider
+                if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON) && CheckCollisionPointRec(mousePos, frameSlider)) {
+                    float newValue = (mousePos.x - frameSlider.x) / frameSlider.width;
+                    newValue = fmaxf(0.0f, fminf(1.0f, newValue));
+                    sliderValue = newValue;
+                    
+                    int targetFrame = (int)(newValue * (totalFrames - 1));
+                    if (targetFrame != currentFrame && frameSequence != NULL && frameSequence[targetFrame].data != NULL) {
+                        currentFrame = targetFrame;
+                        UnloadTexture(originalImageTex);
+                        originalImageTex = LoadTextureFromImage(frameSequence[currentFrame]);
+                        LogMessage("LOG Frame changed via slider");
+                    }
                 }
             }
 
