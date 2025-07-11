@@ -449,11 +449,12 @@ bool LoadExtractedFrames(Image** sequence, TextureBuffer* textureBuffer, int* fr
     }
     
     *fps = gVideoProcessor.fps > 0 ? gVideoProcessor.fps : 30.0f;
+    int totalExpectedFrames = gVideoProcessor.frameCount;
     pthread_mutex_unlock(&gVideoProcessor.mutex);
     
     // Compter les frames actuellement disponibles
     int availableFrames = 0;
-    for (int i = 0; i < 10000; i++) { // Limite raisonnable
+    for (int i = 0; i < 15000; i++) { // Augmenter la limite pour plus de frames
         if (IsFrameAvailable(i)) {
             availableFrames = i + 1;
         } else {
@@ -461,7 +462,7 @@ bool LoadExtractedFrames(Image** sequence, TextureBuffer* textureBuffer, int* fr
         }
     }
     
-    printf("Found %d available frames\n", availableFrames);
+    printf("Found %d available frames (expected: %d)\n", availableFrames, totalExpectedFrames);
     LogMessage("LOG Counted available frames");
     
     if (availableFrames <= 0) {
@@ -470,19 +471,21 @@ bool LoadExtractedFrames(Image** sequence, TextureBuffer* textureBuffer, int* fr
     }
     
     // Allouer la mémoire pour les frames (on alloue pour toutes les frames possibles)
-    *sequence = (Image*)calloc(10000, sizeof(Image)); // Utiliser calloc pour initialiser à zéro
+    *sequence = (Image*)calloc(15000, sizeof(Image)); // Augmenter la capacité
     if (*sequence == NULL) {
         LogMessage("LOG Failed to allocate memory for frames");
         return false;
     }
     
-    // Initialiser le buffer de textures
-    InitTextureBuffer(textureBuffer, 10000);
+    // Initialiser le buffer de textures avec une capacité plus large
+    InitTextureBuffer(textureBuffer, 15000);
     
     LogMessage("LOG Memory allocated for frames and texture buffer");
     
     // Charger les frames disponibles et leurs textures
     int loadedFrames = 0;
+    int failedTextures = 0;
+    
     for (int i = 0; i < availableFrames; i++) {
         if (LoadSpecificFrame(i, &(*sequence)[i])) {
             // Charger la texture dans le buffer
@@ -492,10 +495,22 @@ bool LoadExtractedFrames(Image** sequence, TextureBuffer* textureBuffer, int* fr
                     LogMessage("LOG First frame loaded successfully");
                     printf("*** FIRST FRAME LOADED - READY FOR DISPLAY ***\n");
                 }
+                // Afficher le progrès tous les 50 frames
+                if (loadedFrames % 50 == 0) {
+                    printf("Progress: %d/%d frames loaded (%.1f%%)\n", 
+                           loadedFrames, availableFrames, 
+                           (float)loadedFrames / availableFrames * 100.0f);
+                }
             } else {
                 printf("Failed to load texture for frame %d\n", i);
+                failedTextures++;
                 UnloadImage((*sequence)[i]); // Décharger l'image si la texture a échoué
-                break;
+                
+                // Si trop de textures échouent, arrêter le chargement
+                if (failedTextures > 10) {
+                    printf("Too many texture failures (%d), stopping load\n", failedTextures);
+                    break;
+                }
             }
         } else {
             printf("Failed to load frame %d\n", i);
@@ -505,7 +520,9 @@ bool LoadExtractedFrames(Image** sequence, TextureBuffer* textureBuffer, int* fr
     }
     
     *frameCount = loadedFrames;
-    printf("Total frames loaded: %d\n", loadedFrames);
+    printf("Total frames loaded: %d/%d (%.1f%%) - Texture failures: %d\n", 
+           loadedFrames, availableFrames, 
+           (float)loadedFrames / availableFrames * 100.0f, failedTextures);
     LogMessage("LOG Frame loading completed");
     
     if (loadedFrames == 0) {
@@ -525,15 +542,16 @@ int CheckAndLoadNewFrames(Image** sequence, TextureBuffer* textureBuffer, int cu
     if (!sequence || !*sequence || !textureBuffer) return currentMaxFrames;
     
     int newMaxFrames = currentMaxFrames;
+    int newFramesLoaded = 0;
     
-    // Vérifier les 10 frames suivantes
-    for (int i = currentMaxFrames; i < currentMaxFrames + 10; i++) {
+    // Vérifier plus de frames à la fois pour un chargement plus rapide
+    for (int i = currentMaxFrames; i < currentMaxFrames + 50; i++) {
         if (IsFrameAvailable(i)) {
             if (LoadSpecificFrame(i, &(*sequence)[i])) {
                 // Charger la texture dans le buffer
                 if (LoadTextureToBuffer(textureBuffer, &(*sequence)[i], i)) {
                     newMaxFrames = i + 1;
-                    printf("New frame loaded: %d\n", i + 1);
+                    newFramesLoaded++;
                 } else {
                     printf("Failed to load texture for new frame %d\n", i + 1);
                     UnloadImage((*sequence)[i]); // Décharger l'image si la texture a échoué
@@ -545,6 +563,10 @@ int CheckAndLoadNewFrames(Image** sequence, TextureBuffer* textureBuffer, int cu
         } else {
             break;
         }
+    }
+    
+    if (newFramesLoaded > 0) {
+        printf("Loaded %d new frames: total now %d\n", newFramesLoaded, newMaxFrames);
     }
     
     return newMaxFrames;
@@ -655,6 +677,65 @@ Texture2D* GetTextureFromBuffer(TextureBuffer* buffer, int index) {
     return NULL;
 }
 
+// Fonction pour forcer le chargement de toutes les frames disponibles
+void LoadAllAvailableFrames(Image** sequence, TextureBuffer* textureBuffer, int* totalFrames) {
+    if (!sequence || !*sequence || !textureBuffer) return;
+    
+    printf("=== LOADING ALL AVAILABLE FRAMES ===\n");
+    
+    int currentMax = *totalFrames;
+    int maxAvailable = 0;
+    
+    // Compter toutes les frames disponibles
+    for (int i = 0; i < 15000; i++) {
+        if (IsFrameAvailable(i)) {
+            maxAvailable = i + 1;
+        } else {
+            break;
+        }
+    }
+    
+    printf("Found %d total available frames, currently loaded: %d\n", maxAvailable, currentMax);
+    
+    if (maxAvailable <= currentMax) {
+        printf("All frames already loaded\n");
+        return;
+    }
+    
+    int loadedFrames = 0;
+    int failedFrames = 0;
+    
+    // Charger toutes les frames manquantes
+    for (int i = currentMax; i < maxAvailable; i++) {
+        if (LoadSpecificFrame(i, &(*sequence)[i])) {
+            if (LoadTextureToBuffer(textureBuffer, &(*sequence)[i], i)) {
+                loadedFrames++;
+                if (loadedFrames % 100 == 0) {
+                    printf("Batch loading progress: %d/%d frames\n", 
+                           currentMax + loadedFrames, maxAvailable);
+                }
+            } else {
+                failedFrames++;
+                UnloadImage((*sequence)[i]);
+                if (failedFrames > 20) {
+                    printf("Too many texture failures, stopping batch load\n");
+                    break;
+                }
+            }
+        } else {
+            failedFrames++;
+            if (failedFrames > 20) {
+                printf("Too many load failures, stopping batch load\n");
+                break;
+            }
+        }
+    }
+    
+    *totalFrames = currentMax + loadedFrames;
+    printf("Batch load completed: %d new frames loaded (total: %d)\n", 
+           loadedFrames, *totalFrames);
+}
+
 
 int main(void)
 {
@@ -707,6 +788,8 @@ int main(void)
     Rectangle prevButton = {100, 550, 40, 30};
     Rectangle nextButton = {150, 550, 40, 30};
     Rectangle frameSlider = {10, 590, 180, 20};
+    Rectangle reloadButton = {10, 620, 80, 30};
+    Rectangle loadAllButton = {100, 620, 90, 30};
     float sliderValue = 0.0f;
 
     // Variables pour le système de verrouillage de la souris
@@ -956,7 +1039,7 @@ int main(void)
         
         // Vérifier et charger de nouvelles frames si nécessaire
         if (isSequence && isProcessingVideo) {
-            if (frameCounter % 60 == 0) { // Vérifier toutes les secondes
+            if (frameCounter % 30 == 0) { // Vérifier deux fois par seconde
                 int newMaxFrames = CheckAndLoadNewFrames(&frameSequence, &videoTextureBuffer, totalFrames);
                 if (newMaxFrames > totalFrames) {
                     totalFrames = newMaxFrames;
@@ -1039,7 +1122,9 @@ int main(void)
             mouseOnUI = CheckCollisionPointRec(mouse, playPauseButton) ||
                        CheckCollisionPointRec(mouse, prevButton) ||
                        CheckCollisionPointRec(mouse, nextButton) ||
-                       CheckCollisionPointRec(mouse, frameSlider);
+                       CheckCollisionPointRec(mouse, frameSlider) ||
+                       CheckCollisionPointRec(mouse, reloadButton) ||
+                       CheckCollisionPointRec(mouse, loadAllButton);
         }
         
         if (mouseLocked) {
@@ -1174,8 +1259,26 @@ int main(void)
                 DrawRectangleLinesEx(frameSlider, 2, BLACK);
                 float sliderPos = frameSlider.x + (sliderValue * frameSlider.width);
                 DrawRectangle(sliderPos - 5, frameSlider.y - 2, 10, frameSlider.height + 4, BLUE);
+                
+                // Bouton Reload
+                Color reloadButtonColor = ORANGE;
+                if (CheckCollisionPointRec(mousePos, reloadButton)) {
+                    reloadButtonColor = ColorBrightness(reloadButtonColor, 0.2f);
+                }
+                DrawRectangleRec(reloadButton, reloadButtonColor);
+                DrawRectangleLinesEx(reloadButton, 2, BLACK);
+                DrawText("Reload", reloadButton.x + 10, reloadButton.y + 8, 14, BLACK);
+                
+                // Bouton Load All
+                Color loadAllButtonColor = YELLOW;
+                if (CheckCollisionPointRec(mousePos, loadAllButton)) {
+                    loadAllButtonColor = ColorBrightness(loadAllButtonColor, 0.2f);
+                }
+                DrawRectangleRec(loadAllButton, loadAllButtonColor);
+                DrawRectangleLinesEx(loadAllButton, 2, BLACK);
+                DrawText("Load All", loadAllButton.x + 5, loadAllButton.y + 8, 14, BLACK);
             }
-
+            
             // Modifier rayon
             if (IsKeyDown(KEY_UP)) {
                 radius += 1.0f;
@@ -1302,24 +1405,29 @@ int main(void)
                     }
                 }
                 
-                // Gestion du slider
-                if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON) && CheckCollisionPointRec(mousePos, frameSlider)) {
-                    float newValue = (mousePos.x - frameSlider.x) / frameSlider.width;
-                    newValue = fmaxf(0.0f, fminf(1.0f, newValue));
-                    sliderValue = newValue;
+                // Clic sur le bouton Reload
+                if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON) && CheckCollisionPointRec(mousePos, reloadButton)) {
+                    printf("Reloading video...\n");
+                    currentFrame = 0;
+                    totalFrames = 0;
+                    isPlaying = false;
                     
-                    int targetFrame = (int)(newValue * (totalFrames - 1));
-                    if (targetFrame != currentFrame && frameSequence != NULL && frameSequence[targetFrame].data != NULL) {
-                        currentFrame = targetFrame;
-                        Texture2D* targetTexture = GetTextureFromBuffer(&videoTextureBuffer, currentFrame);
-                        if (targetTexture != NULL) {
-                            originalImageTex = *targetTexture;
-                        } else {
-                            UnloadTexture(originalImageTex);
-                            originalImageTex = LoadTextureFromImage(frameSequence[currentFrame]);
-                        }
-                        LogMessage("LOG Frame changed via slider");
-                    }
+                    // Libérer les textures existantes
+                    FreeTextureBuffer(&videoTextureBuffer);
+                    
+                    // Réinitialiser et recharger
+                    InitTextureBuffer(&videoTextureBuffer, 15000);
+                    LoadExtractedFrames(&frameSequence, &videoTextureBuffer, &totalFrames, &frameRate);
+                    
+                    printf("Video reloaded successfully with %d frames\n", totalFrames);
+                    LogMessage("LOG Video reloaded");
+                }
+                
+                // Clic sur le bouton Load All
+                if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON) && CheckCollisionPointRec(mousePos, loadAllButton)) {
+                    printf("Force loading all available frames...\n");
+                    LoadAllAvailableFrames(&frameSequence, &videoTextureBuffer, &totalFrames);
+                    LogMessage("LOG All frames loaded");
                 }
             }
 
