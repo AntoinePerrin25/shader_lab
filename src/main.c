@@ -105,8 +105,8 @@ time_t My_GetFileModTime(const char *path)
 
 // Structure pour le traitement vidéo avec FFmpeg
 typedef struct {
-    char inputPath[512];
-    char outputDir[512];
+    char inputPath[256];
+    char outputDir[256];
     int frameCount;
     float fps;
     bool isProcessing;
