@@ -121,6 +121,22 @@ typedef struct {
 
 static VideoProcessor gVideoProcessor = {0};
 
+// Structure pour gérer un buffer de textures
+typedef struct {
+    Texture2D* textures;
+    int count;
+    int capacity;
+    bool isAllocated;
+} TextureBuffer;
+
+// Déclarations forward des fonctions
+bool LoadExtractedFrames(Image** sequence, TextureBuffer* textureBuffer, int* frameCount, float* fps);
+int CheckAndLoadNewFrames(Image** sequence, TextureBuffer* textureBuffer, int currentMaxFrames);
+void InitTextureBuffer(TextureBuffer* buffer, int capacity);
+void FreeTextureBuffer(TextureBuffer* buffer);
+bool LoadTextureToBuffer(TextureBuffer* buffer, const Image* image, int index);
+Texture2D* GetTextureFromBuffer(TextureBuffer* buffer, int index);
+
 // Fonction pour initialiser le processeur vidéo
 void InitVideoProcessor(void) {
     memset(&gVideoProcessor, 0, sizeof(VideoProcessor));
@@ -413,8 +429,8 @@ bool LoadSpecificFrame(int frameIndex, Image* frameImage) {
     return frameImage->data != NULL;
 }
 
-// Fonction pour charger les frames extraites avec chargement progressif
-bool LoadExtractedFrames(Image** sequence, int* frameCount, float* fps) {
+// Fonction pour charger les frames extraites avec chargement progressif et buffer de textures
+bool LoadExtractedFrames(Image** sequence, TextureBuffer* textureBuffer, int* frameCount, float* fps) {
     LogMessage("LOG LoadExtractedFrames called");
     printf("=== LOADING EXTRACTED FRAMES ===\n");
     
@@ -460,16 +476,26 @@ bool LoadExtractedFrames(Image** sequence, int* frameCount, float* fps) {
         return false;
     }
     
-    LogMessage("LOG Memory allocated for frames");
+    // Initialiser le buffer de textures
+    InitTextureBuffer(textureBuffer, 10000);
     
-    // Charger les frames disponibles
+    LogMessage("LOG Memory allocated for frames and texture buffer");
+    
+    // Charger les frames disponibles et leurs textures
     int loadedFrames = 0;
     for (int i = 0; i < availableFrames; i++) {
         if (LoadSpecificFrame(i, &(*sequence)[i])) {
-            loadedFrames++;
-            if (loadedFrames == 1) {
-                LogMessage("LOG First frame loaded successfully");
-                printf("*** FIRST FRAME LOADED - READY FOR DISPLAY ***\n");
+            // Charger la texture dans le buffer
+            if (LoadTextureToBuffer(textureBuffer, &(*sequence)[i], i)) {
+                loadedFrames++;
+                if (loadedFrames == 1) {
+                    LogMessage("LOG First frame loaded successfully");
+                    printf("*** FIRST FRAME LOADED - READY FOR DISPLAY ***\n");
+                }
+            } else {
+                printf("Failed to load texture for frame %d\n", i);
+                UnloadImage((*sequence)[i]); // Décharger l'image si la texture a échoué
+                break;
             }
         } else {
             printf("Failed to load frame %d\n", i);
@@ -485,6 +511,7 @@ bool LoadExtractedFrames(Image** sequence, int* frameCount, float* fps) {
     if (loadedFrames == 0) {
         free(*sequence);
         *sequence = NULL;
+        FreeTextureBuffer(textureBuffer);
         LogMessage("LOG No frames loaded - cleaning up");
         return false;
     }
@@ -494,8 +521,8 @@ bool LoadExtractedFrames(Image** sequence, int* frameCount, float* fps) {
 }
 
 // Fonction pour vérifier et charger de nouvelles frames pendant la lecture
-int CheckAndLoadNewFrames(Image** sequence, int currentMaxFrames) {
-    if (!sequence || !*sequence) return currentMaxFrames;
+int CheckAndLoadNewFrames(Image** sequence, TextureBuffer* textureBuffer, int currentMaxFrames) {
+    if (!sequence || !*sequence || !textureBuffer) return currentMaxFrames;
     
     int newMaxFrames = currentMaxFrames;
     
@@ -503,8 +530,15 @@ int CheckAndLoadNewFrames(Image** sequence, int currentMaxFrames) {
     for (int i = currentMaxFrames; i < currentMaxFrames + 10; i++) {
         if (IsFrameAvailable(i)) {
             if (LoadSpecificFrame(i, &(*sequence)[i])) {
-                newMaxFrames = i + 1;
-                printf("New frame loaded: %d\n", i + 1);
+                // Charger la texture dans le buffer
+                if (LoadTextureToBuffer(textureBuffer, &(*sequence)[i], i)) {
+                    newMaxFrames = i + 1;
+                    printf("New frame loaded: %d\n", i + 1);
+                } else {
+                    printf("Failed to load texture for new frame %d\n", i + 1);
+                    UnloadImage((*sequence)[i]); // Décharger l'image si la texture a échoué
+                    break;
+                }
             } else {
                 break;
             }
@@ -558,6 +592,69 @@ void CleanupVideoProcessor(void) {
     printf("Video processor cleanup completed\n");
 }
 
+// Fonction pour initialiser le buffer de textures
+void InitTextureBuffer(TextureBuffer* buffer, int capacity) {
+    buffer->textures = (Texture2D*)calloc(capacity, sizeof(Texture2D));
+    buffer->count = 0;
+    buffer->capacity = capacity;
+    buffer->isAllocated = true;
+    printf("Texture buffer initialized with capacity: %d\n", capacity);
+}
+
+// Fonction pour libérer le buffer de textures
+void FreeTextureBuffer(TextureBuffer* buffer) {
+    if (buffer->isAllocated && buffer->textures) {
+        for (int i = 0; i < buffer->count; i++) {
+            if (buffer->textures[i].id > 0) {
+                UnloadTexture(buffer->textures[i]);
+            }
+        }
+        free(buffer->textures);
+        buffer->textures = NULL;
+        buffer->count = 0;
+        buffer->capacity = 0;
+        buffer->isAllocated = false;
+        printf("Texture buffer freed\n");
+    }
+}
+
+// Fonction pour charger une texture dans le buffer
+bool LoadTextureToBuffer(TextureBuffer* buffer, const Image* image, int index) {
+    if (!buffer->isAllocated || !buffer->textures || index >= buffer->capacity) {
+        printf("ERROR: Invalid texture buffer or index\n");
+        return false;
+    }
+    
+    // Si il y a déjà une texture à cet index, la décharger
+    if (index < buffer->count && buffer->textures[index].id > 0) {
+        UnloadTexture(buffer->textures[index]);
+    }
+    
+    // Charger la nouvelle texture
+    buffer->textures[index] = LoadTextureFromImage(*image);
+    
+    // Mettre à jour le count si nécessaire
+    if (index >= buffer->count) {
+        buffer->count = index + 1;
+    }
+    
+    printf("Texture loaded to buffer at index %d (ID: %d)\n", index, buffer->textures[index].id);
+    return buffer->textures[index].id > 0;
+}
+
+// Fonction pour obtenir une texture du buffer
+Texture2D* GetTextureFromBuffer(TextureBuffer* buffer, int index) {
+    if (!buffer->isAllocated || !buffer->textures || index >= buffer->count || index < 0) {
+        return NULL;
+    }
+    
+    if (buffer->textures[index].id > 0) {
+        return &buffer->textures[index];
+    }
+    
+    return NULL;
+}
+
 
 int main(void)
 {
@@ -596,6 +693,7 @@ int main(void)
     float frameTime = 0.0f;
     float frameRate = 30.0f; // FPS par défaut
     Image* frameSequence = NULL;
+    TextureBuffer videoTextureBuffer = {0}; // Buffer pour les textures vidéo
     char loadedFilePath[512] = {0};
     
     // Variables pour le traitement vidéo
@@ -792,7 +890,7 @@ int main(void)
                     LogMessage("LOG First frames available - attempting to load");
                     printf("*** FIRST FRAMES AVAILABLE - LOADING ***\n");
                     
-                    if (LoadExtractedFrames(&frameSequence, &totalFrames, &frameRate)) {
+                    if (LoadExtractedFrames(&frameSequence, &videoTextureBuffer, &totalFrames, &frameRate)) {
                         LogMessage("LOG Initial frames loaded - setting up sequence");
                         printf("*** INITIAL FRAMES LOADED: %d frames at %.2f FPS ***\n", 
                                totalFrames, frameRate);
@@ -804,11 +902,19 @@ int main(void)
                         
                         // Charger la première frame
                         if (frameSequence != NULL && totalFrames > 0) {
-                            originalImageTex = LoadTextureFromImage(frameSequence[0]);
-                            
-                            LogMessage("LOG First frame texture loaded");
-                            printf("*** FIRST FRAME TEXTURE LOADED: %dx%d ***\n", 
-                                   originalImageTex.width, originalImageTex.height);
+                            // Utiliser la texture du buffer au lieu de créer une nouvelle
+                            Texture2D* firstTexture = GetTextureFromBuffer(&videoTextureBuffer, 0);
+                            if (firstTexture != NULL) {
+                                originalImageTex = *firstTexture;
+                                
+                                LogMessage("LOG First frame texture loaded from buffer");
+                                printf("*** FIRST FRAME TEXTURE LOADED FROM BUFFER: %dx%d ***\n", 
+                                       originalImageTex.width, originalImageTex.height);
+                            } else {
+                                // Fallback: créer la texture normalement
+                                originalImageTex = LoadTextureFromImage(frameSequence[0]);
+                                LogMessage("LOG First frame texture loaded (fallback)");
+                            }
                         
                             // Calculer les dimensions pour adapter l'image à la fenêtre
                             float availableWidth = screenWidth - 200;
@@ -850,9 +956,8 @@ int main(void)
         
         // Vérifier et charger de nouvelles frames si nécessaire
         if (isSequence && isProcessingVideo) {
-            static int lastFrameCheck = 0;
             if (frameCounter % 60 == 0) { // Vérifier toutes les secondes
-                int newMaxFrames = CheckAndLoadNewFrames(&frameSequence, totalFrames);
+                int newMaxFrames = CheckAndLoadNewFrames(&frameSequence, &videoTextureBuffer, totalFrames);
                 if (newMaxFrames > totalFrames) {
                     totalFrames = newMaxFrames;
                     printf("Updated total frames to: %d\n", totalFrames);
@@ -871,9 +976,17 @@ int main(void)
                 if (nextFrame < totalFrames && frameSequence[nextFrame].data != NULL) {
                     currentFrame = nextFrame;
                     
-                    // Mettre à jour la texture avec la frame actuelle
-                    UnloadTexture(originalImageTex);
-                    originalImageTex = LoadTextureFromImage(frameSequence[currentFrame]);
+                    // Mettre à jour la texture avec la frame actuelle depuis le buffer
+                    Texture2D* nextTexture = GetTextureFromBuffer(&videoTextureBuffer, currentFrame);
+                    if (nextTexture != NULL) {
+                        originalImageTex = *nextTexture;
+                        LogMessage("LOG Frame updated from texture buffer");
+                    } else {
+                        // Fallback: créer la texture normalement
+                        UnloadTexture(originalImageTex);
+                        originalImageTex = LoadTextureFromImage(frameSequence[currentFrame]);
+                        LogMessage("LOG Frame updated (fallback - texture creation)");
+                    }
                     
                     // Mettre à jour le slider
                     sliderValue = totalFrames > 1 ? (float)currentFrame / (float)(totalFrames - 1) : 0.0f;
@@ -883,8 +996,13 @@ int main(void)
                         // Fin de séquence, recommencer au début
                         currentFrame = 0;
                         if (frameSequence != NULL && frameSequence[0].data != NULL) {
-                            UnloadTexture(originalImageTex);
-                            originalImageTex = LoadTextureFromImage(frameSequence[currentFrame]);
+                            Texture2D* firstTexture = GetTextureFromBuffer(&videoTextureBuffer, 0);
+                            if (firstTexture != NULL) {
+                                originalImageTex = *firstTexture;
+                            } else {
+                                UnloadTexture(originalImageTex);
+                                originalImageTex = LoadTextureFromImage(frameSequence[currentFrame]);
+                            }
                         }
                         sliderValue = 0.0f;
                     } else {
@@ -895,8 +1013,11 @@ int main(void)
                         
                         // Essayer de charger la frame manquante
                         if (LoadSpecificFrame(nextFrame, &frameSequence[nextFrame])) {
-                            printf("Late frame %d loaded, resuming playback\n", nextFrame);
-                            isPlaying = true;
+                            // Charger la texture dans le buffer
+                            if (LoadTextureToBuffer(&videoTextureBuffer, &frameSequence[nextFrame], nextFrame)) {
+                                printf("Late frame %d loaded, resuming playback\n", nextFrame);
+                                isPlaying = true;
+                            }
                         }
                     }
                 }
@@ -1095,8 +1216,13 @@ int main(void)
                     int prevFrame = (currentFrame - 1 + totalFrames) % totalFrames;
                     if (frameSequence != NULL && frameSequence[prevFrame].data != NULL) {
                         currentFrame = prevFrame;
-                        UnloadTexture(originalImageTex);
-                        originalImageTex = LoadTextureFromImage(frameSequence[currentFrame]);
+                        Texture2D* prevTexture = GetTextureFromBuffer(&videoTextureBuffer, currentFrame);
+                        if (prevTexture != NULL) {
+                            originalImageTex = *prevTexture;
+                        } else {
+                            UnloadTexture(originalImageTex);
+                            originalImageTex = LoadTextureFromImage(frameSequence[currentFrame]);
+                        }
                         sliderValue = totalFrames > 1 ? (float)currentFrame / (float)(totalFrames - 1) : 0.0f;
                         LogMessage("LOG Previous frame (keyboard)");
                     }
@@ -1105,8 +1231,13 @@ int main(void)
                     int nextFrame = (currentFrame + 1) % totalFrames;
                     if (frameSequence != NULL && frameSequence[nextFrame].data != NULL) {
                         currentFrame = nextFrame;
-                        UnloadTexture(originalImageTex);
-                        originalImageTex = LoadTextureFromImage(frameSequence[currentFrame]);
+                        Texture2D* nextTexture = GetTextureFromBuffer(&videoTextureBuffer, currentFrame);
+                        if (nextTexture != NULL) {
+                            originalImageTex = *nextTexture;
+                        } else {
+                            UnloadTexture(originalImageTex);
+                            originalImageTex = LoadTextureFromImage(frameSequence[currentFrame]);
+                        }
                         sliderValue = totalFrames > 1 ? (float)currentFrame / (float)(totalFrames - 1) : 0.0f;
                         LogMessage("LOG Next frame (keyboard)");
                     } else {
@@ -1140,8 +1271,13 @@ int main(void)
                     int prevFrame = (currentFrame - 1 + totalFrames) % totalFrames;
                     if (frameSequence != NULL && frameSequence[prevFrame].data != NULL) {
                         currentFrame = prevFrame;
-                        UnloadTexture(originalImageTex);
-                        originalImageTex = LoadTextureFromImage(frameSequence[currentFrame]);
+                        Texture2D* prevTexture = GetTextureFromBuffer(&videoTextureBuffer, currentFrame);
+                        if (prevTexture != NULL) {
+                            originalImageTex = *prevTexture;
+                        } else {
+                            UnloadTexture(originalImageTex);
+                            originalImageTex = LoadTextureFromImage(frameSequence[currentFrame]);
+                        }
                         sliderValue = totalFrames > 1 ? (float)currentFrame / (float)(totalFrames - 1) : 0.0f;
                         LogMessage("LOG Previous frame (button)");
                     }
@@ -1152,8 +1288,13 @@ int main(void)
                     int nextFrame = (currentFrame + 1) % totalFrames;
                     if (frameSequence != NULL && frameSequence[nextFrame].data != NULL) {
                         currentFrame = nextFrame;
-                        UnloadTexture(originalImageTex);
-                        originalImageTex = LoadTextureFromImage(frameSequence[currentFrame]);
+                        Texture2D* nextTexture = GetTextureFromBuffer(&videoTextureBuffer, currentFrame);
+                        if (nextTexture != NULL) {
+                            originalImageTex = *nextTexture;
+                        } else {
+                            UnloadTexture(originalImageTex);
+                            originalImageTex = LoadTextureFromImage(frameSequence[currentFrame]);
+                        }
                         sliderValue = totalFrames > 1 ? (float)currentFrame / (float)(totalFrames - 1) : 0.0f;
                         LogMessage("LOG Next frame (button)");
                     } else {
@@ -1170,8 +1311,13 @@ int main(void)
                     int targetFrame = (int)(newValue * (totalFrames - 1));
                     if (targetFrame != currentFrame && frameSequence != NULL && frameSequence[targetFrame].data != NULL) {
                         currentFrame = targetFrame;
-                        UnloadTexture(originalImageTex);
-                        originalImageTex = LoadTextureFromImage(frameSequence[currentFrame]);
+                        Texture2D* targetTexture = GetTextureFromBuffer(&videoTextureBuffer, currentFrame);
+                        if (targetTexture != NULL) {
+                            originalImageTex = *targetTexture;
+                        } else {
+                            UnloadTexture(originalImageTex);
+                            originalImageTex = LoadTextureFromImage(frameSequence[currentFrame]);
+                        }
                         LogMessage("LOG Frame changed via slider");
                     }
                 }
@@ -1269,6 +1415,9 @@ int main(void)
         }
         free(frameSequence);
     }
+    
+    // Nettoyer le buffer de textures
+    FreeTextureBuffer(&videoTextureBuffer);
     
     UnloadShader(shader);
     CloseWindow();
