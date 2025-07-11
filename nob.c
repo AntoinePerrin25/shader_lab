@@ -7,7 +7,7 @@
 int main(int argc, char **argv) {
     NOB_GO_REBUILD_URSELF(argc, argv);
 
-    // gcc build/main.c.o build/objects.c.o -o main.exe -Llib -lraylib -lopengl32 -lgdi32 -lwinmm -mwindows
+    // gcc -Wall -Wextra -Iinclude -Llib -o main.exe -O2 src/main.c -lraylib -lopengl32 -lgdi32 -lwinmm -mwindows
     Nob_Cmd cmd = {0};
     nob_cmd_append(&cmd, "gcc", "-Wall", "-Wextra");
     nob_cmd_append(&cmd, "-Iinclude", "-Llib");
@@ -15,7 +15,7 @@ int main(int argc, char **argv) {
     nob_cmd_append(&cmd, "-O2");
     nob_cmd_append(&cmd, "src/main.c");
     nob_cmd_append(&cmd, "-lraylib", "-lopengl32", "-lgdi32", "-lwinmm");
-    //nob_cmd_append(&cmd, "-mwindows");
+    nob_cmd_append(&cmd, "-mwindows");
     if (!nob_cmd_run_sync(cmd)) return 1;
    
     return 0;

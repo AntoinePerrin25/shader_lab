@@ -1,2 +1,6 @@
 *.exe
 debug.log
+*.old
+*.mp4
+*.mov
+*.png

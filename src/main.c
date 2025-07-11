@@ -5,7 +5,7 @@
 #include <time.h>
 #include <math.h> // Pour fminf, fmaxf
 #include <stdlib.h>
-#include <pthread.h> // Pour les threads
+// Removed pthread dependency - using synchronous processing
 #include <dirent.h> // Pour parcourir les répertoires
 #include <unistd.h> // Pour access()
 #ifdef _WIN32
@@ -94,6 +94,64 @@ void CloseLogger(void) {
         fclose(gLogManager.logFile);
     }
 }
+
+// Structure pour gérer les erreurs de shader
+typedef struct {
+    bool hasError;
+    char errorMessage[512];
+    bool isDefaultShader;
+} ShaderState;
+
+// Shader par défaut simple qui ne fait rien
+const char* defaultFragmentShader = 
+"#version 460\n"
+"in vec2 fragTexCoord;\n"
+"out vec4 fragColor;\n"
+"uniform sampler2D texture0;\n"
+"void main() {\n"
+"    fragColor = texture(texture0, fragTexCoord);\n"
+"}\n";
+
+// Fonction pour charger un shader de manière sécurisée
+Shader LoadShaderSafe(const char* vsFileName, const char* fsFileName, ShaderState* state) {
+    Shader shader = {0};
+    
+    // Réinitialiser l'état
+    state->hasError = false;
+    state->errorMessage[0] = '\0';
+    state->isDefaultShader = false;
+    
+    // Essayer de charger le shader
+    shader = LoadShader(vsFileName, fsFileName);
+    
+    // Vérifier si le shader est valide
+    if (shader.id == 0) {
+        // Échec du chargement, utiliser le shader par défaut
+        printf("ERROR: Failed to load shader '%s'\n", fsFileName);
+        LogMessage("LOG Shader loading failed");
+        
+        // Charger le shader par défaut
+        shader = LoadShaderFromMemory(NULL, defaultFragmentShader);
+        
+        if (shader.id == 0) {
+            // Même le shader par défaut a échoué
+            state->hasError = true;
+            snprintf(state->errorMessage, sizeof(state->errorMessage), 
+                    "ERREUR CRITIQUE: Impossible de charger le shader par défaut");
+            printf("CRITICAL ERROR: Cannot load default shader\n");
+        } else {
+            state->isDefaultShader = true;
+            snprintf(state->errorMessage, sizeof(state->errorMessage), 
+                    "ERREUR SHADER: Utilisation du shader par défaut. Vérifiez '%s'", fsFileName);
+            printf("Using default shader due to error in '%s'\n", fsFileName);
+        }
+    } else {
+        printf("Shader loaded successfully: %s\n", fsFileName);
+        LogMessage("LOG Shader loaded successfully");
+    }
+    
+    return shader;
+}
 time_t My_GetFileModTime(const char *path)
 {
     struct stat attrib;
@@ -103,20 +161,15 @@ time_t My_GetFileModTime(const char *path)
         return 0;
 }
 
-// Structure pour le traitement vidéo avec FFmpeg
+// Structure pour le traitement vidéo synchrone
 typedef struct {
     char inputPath[256];
     char outputDir[256];
     int frameCount;
     float fps;
-    bool isProcessing;
     bool isCompleted;
     bool hasError;
-    bool ffmpegFinished;  // Nouveau flag pour indiquer si FFmpeg a terminé
     char errorMessage[256];
-    pthread_t thread;
-    pthread_mutex_t mutex;
-    pthread_cond_t condition; // Pour la synchronisation
 } VideoProcessor;
 
 static VideoProcessor gVideoProcessor = {0};
@@ -140,10 +193,8 @@ Texture2D* GetTextureFromBuffer(TextureBuffer* buffer, int index);
 // Fonction pour initialiser le processeur vidéo
 void InitVideoProcessor(void) {
     memset(&gVideoProcessor, 0, sizeof(VideoProcessor));
-    pthread_mutex_init(&gVideoProcessor.mutex, NULL);
-    pthread_cond_init(&gVideoProcessor.condition, NULL);
     snprintf(gVideoProcessor.outputDir, sizeof(gVideoProcessor.outputDir), "./temp_frames/");
-    printf("Video processor initialized\n");
+    printf("Video processor initialized (synchronous mode)\n");
 }
 
 // Fonction pour nettoyer le répertoire temporaire
@@ -163,17 +214,16 @@ void CleanupTempFrames(void) {
     rmdir(gVideoProcessor.outputDir);
 }
 
-// Fonction thread pour traiter la vidéo avec FFmpeg
-void* ProcessVideoThread(void* arg) {
-    UNUSED arg;
+// Fonction synchrone pour traiter la vidéo avec FFmpeg
+bool ProcessVideoSynchronous(const char* videoPath) {
+    printf("=== PROCESSING VIDEO SYNCHRONOUSLY ===\n");
     
-    pthread_mutex_lock(&gVideoProcessor.mutex);
-    printf("=== VIDEO THREAD STARTED ===\n");
-    gVideoProcessor.isProcessing = true;
+    // Copier le chemin de la vidéo
+    strcpy(gVideoProcessor.inputPath, videoPath);
     gVideoProcessor.isCompleted = false;
     gVideoProcessor.hasError = false;
-    gVideoProcessor.ffmpegFinished = false;
-    pthread_mutex_unlock(&gVideoProcessor.mutex);
+    gVideoProcessor.frameCount = 0;
+    gVideoProcessor.fps = 0.0f;
     
     // Créer le répertoire temporaire
     printf("Creating temp directory...\n");
@@ -185,13 +235,9 @@ void* ProcessVideoThread(void* arg) {
     
     if (mkdirResult != 0) {
         printf("ERROR: Failed to create temp directory\n");
-        pthread_mutex_lock(&gVideoProcessor.mutex);
         gVideoProcessor.hasError = true;
         strcpy(gVideoProcessor.errorMessage, "Impossible de créer le répertoire temporaire");
-        gVideoProcessor.isProcessing = false;
-        pthread_cond_broadcast(&gVideoProcessor.condition);
-        pthread_mutex_unlock(&gVideoProcessor.mutex);
-        return NULL;
+        return false;
     }
     
     // Commande FFmpeg pour extraire les frames et obtenir les informations
@@ -201,7 +247,7 @@ void* ProcessVideoThread(void* arg) {
     printf("Getting video info with ffprobe...\n");
     // D'abord, obtenir les informations sur la vidéo (FPS, durée, etc.)
     snprintf(ffprobeCmd, sizeof(ffprobeCmd), "ffprobe -v quiet -select_streams v:0 -show_entries stream=r_frame_rate -of csv=p=0 \"%s\" > temp_fps.txt", 
-            gVideoProcessor.inputPath);
+            videoPath);
     
     int result = system(ffprobeCmd);
     if (result == 0) {
@@ -238,98 +284,56 @@ void* ProcessVideoThread(void* arg) {
     // Extraire les frames avec FFmpeg
     printf("Starting FFmpeg frame extraction...\n");
     snprintf(ffmpegCmd, sizeof(ffmpegCmd), "ffmpeg -i \"%s\" \"%sframe_%%06d.png\" -y", 
-            gVideoProcessor.inputPath, gVideoProcessor.outputDir);
+            videoPath, gVideoProcessor.outputDir);
     
     printf("Executing FFmpeg command: %s\n", ffmpegCmd);
     result = system(ffmpegCmd);
     printf("FFmpeg command result: %d\n", result);
     
-    // Marquer FFmpeg comme terminé
-    pthread_mutex_lock(&gVideoProcessor.mutex);
-    gVideoProcessor.ffmpegFinished = true;
-    printf("FFmpeg process finished with code: %d\n", result);
-    pthread_mutex_unlock(&gVideoProcessor.mutex);
-    
     if (result != 0) {
         printf("ERROR: FFmpeg failed with error code: %d\n", result);
-        pthread_mutex_lock(&gVideoProcessor.mutex);
         gVideoProcessor.hasError = true;
         snprintf(gVideoProcessor.errorMessage, sizeof(gVideoProcessor.errorMessage), 
                 "Erreur FFmpeg (code: %d)", result);
-        gVideoProcessor.isProcessing = false;
-        pthread_cond_broadcast(&gVideoProcessor.condition);
-        pthread_mutex_unlock(&gVideoProcessor.mutex);
-        return NULL;
+        return false;
     }
     
-    // Attendre et compter les frames de manière plus robuste
-    printf("FFmpeg extraction successful, counting frames...\n");
+    // Attendre que FFmpeg termine et compter les frames une seule fois
+    printf("FFmpeg extraction successful, waiting for completion...\n");
     
-    int attempts = 0;
-    int lastCount = 0;
-    int stableCount = 0;
-    int maxAttempts = 15; // Augmenter encore plus le nombre de tentatives
+    #ifdef _WIN32
+    Sleep(2000); // Attendre 2 secondes pour que FFmpeg termine
+    #else
+    sleep(2);
+    #endif
+    
+    // Compter le nombre de frames générées (une seule fois)
+    DIR* dir = opendir(gVideoProcessor.outputDir);
     int finalFrameCount = 0;
-    
-    while (attempts < maxAttempts) {
-        #ifdef _WIN32
-        Sleep(1000); // Attendre 1 seconde entre chaque tentative
-        #else
-        sleep(1);
-        #endif
-        
-        // Compter le nombre de frames générées
-        DIR* dir = opendir(gVideoProcessor.outputDir);
-        int count = 0;
-        if (dir) {
-            struct dirent* entry;
-            while ((entry = readdir(dir)) != NULL) {
-                if (strstr(entry->d_name, "frame_") && strstr(entry->d_name, ".png")) {
-                    // Vérifier que le fichier n'est pas vide (protection contre les fichiers en cours d'écriture)
-                    char fullPath[1024];
-                    snprintf(fullPath, sizeof(fullPath), "%s%s", gVideoProcessor.outputDir, entry->d_name);
-                    FILE* testFile = fopen(fullPath, "rb");
-                    if (testFile) {
-                        fseek(testFile, 0, SEEK_END);
-                        long size = ftell(testFile);
-                        fclose(testFile);
-                        if (size > 100) { // Fichier doit avoir au moins 100 bytes (PNG valide)
-                            count++;
-                        }
+    if (dir) {
+        struct dirent* entry;
+        while ((entry = readdir(dir)) != NULL) {
+            if (strstr(entry->d_name, "frame_") && strstr(entry->d_name, ".png")) {
+                // Vérifier que le fichier n'est pas vide
+                char fullPath[1024];
+                snprintf(fullPath, sizeof(fullPath), "%s%s", gVideoProcessor.outputDir, entry->d_name);
+                FILE* testFile = fopen(fullPath, "rb");
+                if (testFile) {
+                    fseek(testFile, 0, SEEK_END);
+                    long size = ftell(testFile);
+                    fclose(testFile);
+                    if (size > 100) { // Fichier doit avoir au moins 100 bytes
+                        finalFrameCount++;
                     }
                 }
             }
-            closedir(dir);
         }
-        
-        printf("Attempt %d/%d: Found %d frames (stable: %d)\n", 
-               attempts + 1, maxAttempts, count, stableCount);
-        
-        // Si le compte est stable (même nombre plusieurs fois de suite), on a probablement fini
-        if (count == lastCount && count > 0) {
-            stableCount++;
-            printf("Frame count stable at %d for %d attempts\n", count, stableCount);
-            if (stableCount >= 4) { // Augmenter encore le seuil de stabilité
-                finalFrameCount = count;
-                printf("Frame count stabilized at: %d\n", finalFrameCount);
-                break;
-            }
-        } else {
-            stableCount = 0;
-        }
-        
-        lastCount = count;
-        attempts++;
+        closedir(dir);
     }
     
-    // Utiliser le dernier compte même si pas stable
-    if (finalFrameCount == 0) {
-        finalFrameCount = lastCount;
-        printf("Using last count: %d (not stable)\n", finalFrameCount);
-    }
+    printf("Frame extraction completed: %d frames found\n", finalFrameCount);
     
     // Finaliser le traitement
-    pthread_mutex_lock(&gVideoProcessor.mutex);
     gVideoProcessor.frameCount = finalFrameCount;
     printf("=== FINAL FRAME COUNT: %d ===\n", finalFrameCount);
     
@@ -338,57 +342,25 @@ void* ProcessVideoThread(void* arg) {
         gVideoProcessor.hasError = false;
         printf("*** VIDEO PROCESSING COMPLETED SUCCESSFULLY ***\n");
         printf("*** %d frames extracted at %.2f FPS ***\n", finalFrameCount, gVideoProcessor.fps);
+        return true;
     } else {
         gVideoProcessor.hasError = true;
         strcpy(gVideoProcessor.errorMessage, "Aucune frame extraite");
         printf("ERROR: No frames extracted\n");
-    }
-    
-    gVideoProcessor.isProcessing = false;
-    pthread_cond_broadcast(&gVideoProcessor.condition); // Notifier le thread principal
-    pthread_mutex_unlock(&gVideoProcessor.mutex);
-    
-    printf("=== VIDEO THREAD FINISHED ===\n");
-    return NULL;
-}
-
-// Fonction pour démarrer le traitement vidéo
-bool StartVideoProcessing(const char* videoPath) {
-    // Vérifier si un traitement est déjà en cours
-    pthread_mutex_lock(&gVideoProcessor.mutex);
-    if (gVideoProcessor.isProcessing) {
-        printf("WARNING: Video processing already in progress\n");
-        pthread_mutex_unlock(&gVideoProcessor.mutex);
         return false;
     }
-    
-    printf("=== STARTING VIDEO PROCESSING ===\n");
+}
+
+// Fonction pour démarrer le traitement vidéo synchrone
+bool StartVideoProcessing(const char* videoPath) {
+    printf("=== STARTING VIDEO PROCESSING (SYNCHRONOUS) ===\n");
     printf("Video file: %s\n", videoPath);
     
     // Nettoyer les frames précédentes
     CleanupTempFrames();
     
-    // Réinitialiser les variables
-    gVideoProcessor.frameCount = 0;
-    gVideoProcessor.fps = 0.0f;
-    gVideoProcessor.isCompleted = false;
-    gVideoProcessor.hasError = false;
-    gVideoProcessor.ffmpegFinished = false;
-    gVideoProcessor.errorMessage[0] = '\0';
-    
-    // Copier le chemin de la vidéo
-    strcpy(gVideoProcessor.inputPath, videoPath);
-    pthread_mutex_unlock(&gVideoProcessor.mutex);
-    
-    // Créer le thread de traitement
-    int result = pthread_create(&gVideoProcessor.thread, NULL, ProcessVideoThread, NULL);
-    if (result != 0) {
-        printf("ERROR: Failed to create video processing thread (error: %d)\n", result);
-        return false;
-    }
-    
-    printf("Video processing thread created successfully\n");
-    return true;
+    // Traiter la vidéo immédiatement
+    return ProcessVideoSynchronous(videoPath);
 }
 
 // Fonction pour vérifier si une frame spécifique est disponible
@@ -429,32 +401,28 @@ bool LoadSpecificFrame(int frameIndex, Image* frameImage) {
     return frameImage->data != NULL;
 }
 
-// Fonction pour charger les frames extraites avec chargement progressif et buffer de textures
+// Fonction pour charger les frames extraites (version synchrone)
 bool LoadExtractedFrames(Image** sequence, TextureBuffer* textureBuffer, int* frameCount, float* fps) {
     LogMessage("LOG LoadExtractedFrames called");
     printf("=== LOADING EXTRACTED FRAMES ===\n");
     
-    pthread_mutex_lock(&gVideoProcessor.mutex);
+    printf("LoadExtractedFrames: checking state - completed=%d, hasError=%d, frameCount=%d\n", 
+           gVideoProcessor.isCompleted, gVideoProcessor.hasError, gVideoProcessor.frameCount);
     
-    printf("LoadExtractedFrames: checking state - completed=%d, hasError=%d, processing=%d, frameCount=%d\n", 
-           gVideoProcessor.isCompleted, gVideoProcessor.hasError, gVideoProcessor.isProcessing, gVideoProcessor.frameCount);
-    
-    // Permettre le chargement même si le traitement n'est pas complètement terminé
+    // Vérifier que le traitement est terminé
     if (gVideoProcessor.hasError) {
         printf("LoadExtractedFrames failed: hasError=%d, error='%s'\n", 
                gVideoProcessor.hasError, gVideoProcessor.errorMessage);
         LogMessage("LOG LoadExtractedFrames failed - has error");
-        pthread_mutex_unlock(&gVideoProcessor.mutex);
         return false;
     }
     
     *fps = gVideoProcessor.fps > 0 ? gVideoProcessor.fps : 30.0f;
     int totalExpectedFrames = gVideoProcessor.frameCount;
-    pthread_mutex_unlock(&gVideoProcessor.mutex);
     
     // Compter les frames actuellement disponibles
     int availableFrames = 0;
-    for (int i = 0; i < 15000; i++) { // Augmenter la limite pour plus de frames
+    for (int i = 0; i < 15000; i++) {
         if (IsFrameAvailable(i)) {
             availableFrames = i + 1;
         } else {
@@ -470,14 +438,14 @@ bool LoadExtractedFrames(Image** sequence, TextureBuffer* textureBuffer, int* fr
         return false;
     }
     
-    // Allouer la mémoire pour les frames (on alloue pour toutes les frames possibles)
-    *sequence = (Image*)calloc(15000, sizeof(Image)); // Augmenter la capacité
+    // Allouer la mémoire pour les frames
+    *sequence = (Image*)calloc(15000, sizeof(Image));
     if (*sequence == NULL) {
         LogMessage("LOG Failed to allocate memory for frames");
         return false;
     }
     
-    // Initialiser le buffer de textures avec une capacité plus large
+    // Initialiser le buffer de textures
     InitTextureBuffer(textureBuffer, 15000);
     
     LogMessage("LOG Memory allocated for frames and texture buffer");
@@ -504,9 +472,8 @@ bool LoadExtractedFrames(Image** sequence, TextureBuffer* textureBuffer, int* fr
             } else {
                 printf("Failed to load texture for frame %d\n", i);
                 failedTextures++;
-                UnloadImage((*sequence)[i]); // Décharger l'image si la texture a échoué
+                UnloadImage((*sequence)[i]);
                 
-                // Si trop de textures échouent, arrêter le chargement
                 if (failedTextures > 10) {
                     printf("Too many texture failures (%d), stopping load\n", failedTextures);
                     break;
@@ -515,7 +482,7 @@ bool LoadExtractedFrames(Image** sequence, TextureBuffer* textureBuffer, int* fr
         } else {
             printf("Failed to load frame %d\n", i);
             LogMessage("LOG Failed to load specific frame");
-            break; // Arrêter au premier échec pour maintenir la séquence
+            break;
         }
     }
     
@@ -572,45 +539,22 @@ int CheckAndLoadNewFrames(Image** sequence, TextureBuffer* textureBuffer, int cu
     return newMaxFrames;
 }
 
-// Fonction pour obtenir le statut du traitement vidéo
+// Fonction pour obtenir le statut du traitement vidéo (version synchrone)
 void GetVideoProcessingStatus(bool* isProcessing, bool* isCompleted, bool* hasError, char* errorMsg) {
-    pthread_mutex_lock(&gVideoProcessor.mutex);
-    *isProcessing = gVideoProcessor.isProcessing;
+    *isProcessing = false; // En mode synchrone, le traitement n'est jamais en cours
     *isCompleted = gVideoProcessor.isCompleted;
     *hasError = gVideoProcessor.hasError;
     
     if (errorMsg && gVideoProcessor.hasError) {
         strcpy(errorMsg, gVideoProcessor.errorMessage);
     }
-    
-    // Debug: afficher le statut détaillé
-    static int statusCallCount = 0;
-    statusCallCount++;
-    if (statusCallCount % 60 == 0) { // Afficher toutes les 60 vérifications (1 seconde)
-        printf("GetVideoProcessingStatus #%d: processing=%d, completed=%d, hasError=%d, ffmpegFinished=%d\n", 
-               statusCallCount, *isProcessing, *isCompleted, *hasError, gVideoProcessor.ffmpegFinished);
-    }
-    
-    pthread_mutex_unlock(&gVideoProcessor.mutex);
 }
 
-// Fonction pour nettoyer le processeur vidéo
+// Fonction pour nettoyer le processeur vidéo (version synchrone)
 void CleanupVideoProcessor(void) {
     printf("Cleaning up video processor...\n");
     
-    pthread_mutex_lock(&gVideoProcessor.mutex);
-    if (gVideoProcessor.isProcessing) {
-        printf("Waiting for video processing thread to finish...\n");
-        pthread_mutex_unlock(&gVideoProcessor.mutex);
-        pthread_join(gVideoProcessor.thread, NULL);
-        printf("Video processing thread joined\n");
-    } else {
-        pthread_mutex_unlock(&gVideoProcessor.mutex);
-    }
-    
     CleanupTempFrames();
-    pthread_mutex_destroy(&gVideoProcessor.mutex);
-    pthread_cond_destroy(&gVideoProcessor.condition);
     printf("Video processor cleanup completed\n");
 }
 
@@ -752,8 +696,9 @@ int main(void)
     LogMessage("LOG Window Initialized");
 
     const char *shaderPath = "effect.fs";
-    Shader shader = LoadShader(0, shaderPath);
-    LogMessage("LOG Shader Loaded");
+    ShaderState shaderState = {0};
+    Shader shader = LoadShaderSafe(0, shaderPath, &shaderState);
+    LogMessage("LOG Shader loaded with error checking");
 
     time_t lastModTime = My_GetFileModTime(shaderPath);
     LogMessage("LOG File mod time retrieved");
@@ -777,10 +722,7 @@ int main(void)
     TextureBuffer videoTextureBuffer = {0}; // Buffer pour les textures vidéo
     char loadedFilePath[512] = {0};
     
-    // Variables pour le traitement vidéo
-    bool isProcessingVideo = false;
-    bool videoProcessingCompleted = false;
-    bool videoProcessingError = false;
+    // Variables pour le traitement vidéo (simplifiées pour le mode synchrone)
     char videoErrorMessage[256] = {0};
     
     // Variables pour les contrôles UI
@@ -839,6 +781,8 @@ int main(void)
                         free(frameSequence);
                         frameSequence = NULL;
                     }
+                    // Nettoyer le buffer de textures vidéo
+                    FreeTextureBuffer(&videoTextureBuffer);
                     
                     // Charger la nouvelle image
                     Image img = LoadImage(files.paths[0]);
@@ -902,16 +846,66 @@ int main(void)
                         free(frameSequence);
                         frameSequence = NULL;
                     }
+                    // Nettoyer le buffer de textures vidéo
+                    FreeTextureBuffer(&videoTextureBuffer);
                     
-                    // Démarrer le traitement vidéo
+                    // Démarrer le traitement vidéo synchrone
                     if (StartVideoProcessing(files.paths[0])) {
                         strcpy(loadedFilePath, files.paths[0]);
-                        isProcessingVideo = true;
-                        videoProcessingCompleted = false;
-                        videoProcessingError = false;
-                        LogMessage("LOG Video processing started");
+                        
+                        // En mode synchrone, charger immédiatement les frames
+                        if (LoadExtractedFrames(&frameSequence, &videoTextureBuffer, &totalFrames, &frameRate)) {
+                            LogMessage("LOG Video frames loaded successfully");
+                            printf("*** VIDEO FRAMES LOADED: %d frames at %.2f FPS ***\n", totalFrames, frameRate);
+                            
+                            isSequence = true;
+                            currentFrame = 0;
+                            frameTime = 0.0f;
+                            sliderValue = 0.0f;
+                            
+                            // Charger la première frame
+                            if (frameSequence != NULL && totalFrames > 0) {
+                                Texture2D* firstTexture = GetTextureFromBuffer(&videoTextureBuffer, 0);
+                                if (firstTexture != NULL) {
+                                    originalImageTex = *firstTexture;
+                                } else {
+                                    originalImageTex = LoadTextureFromImage(frameSequence[0]);
+                                }
+                                
+                                // Calculer les dimensions pour adapter l'image à la fenêtre
+                                float availableWidth = screenWidth - 200;
+                                float availableHeight = screenHeight;
+                                
+                                float scaleX = availableWidth / originalImageTex.width;
+                                float scaleY = availableHeight / originalImageTex.height;
+                                float scale = fminf(scaleX, scaleY);
+                                
+                                imageScale.x = scale;
+                                imageScale.y = scale;
+                                
+                                float scaledWidth = originalImageTex.width * scale;
+                                float scaledHeight = originalImageTex.height * scale;
+                                
+                                imageRect.x = 200 + (availableWidth - scaledWidth) / 2;
+                                imageRect.y = (availableHeight - scaledHeight) / 2;
+                                imageRect.width = scaledWidth;
+                                imageRect.height = scaledHeight;
+                                
+                                sourceRect.x = 0;
+                                sourceRect.y = 0;
+                                sourceRect.width = originalImageTex.width;
+                                sourceRect.height = originalImageTex.height;
+                                
+                                printf("*** VIDEO READY FOR PLAYBACK ***\n");
+                                LogMessage("LOG Video ready for playback");
+                            }
+                        } else {
+                            LogMessage("LOG Failed to load video frames");
+                            printf("ERROR: Failed to load video frames\n");
+                        }
                     } else {
                         LogMessage("LOG Failed to start video processing");
+                        printf("ERROR: Failed to process video\n");
                     }
                 }
                 else
@@ -931,7 +925,7 @@ int main(void)
             {
                 lastModTime = modTime;
                 UnloadShader(shader);
-                shader = LoadShader(0, shaderPath);
+                shader = LoadShaderSafe(0, shaderPath, &shaderState);
                 LogMessage("LOG Shader reloaded due to file modification");
                 TraceLog(LOG_INFO, "Shader reloaded due to file modification.");
             }
@@ -957,96 +951,8 @@ int main(void)
         }
         wasSpacePressed = spacePressed;
 
-        // Vérifier le statut du traitement vidéo
-        if (isProcessingVideo) {
-            printf("Checking video processing status...\n");
-            GetVideoProcessingStatus(&isProcessingVideo, &videoProcessingCompleted, 
-                                   &videoProcessingError, videoErrorMessage);
-            
-            printf("Status check: isProcessingVideo=%d, completed=%d, error=%d\n", 
-                   isProcessingVideo, videoProcessingCompleted, videoProcessingError);
-            
-            // Essayer de charger les frames dès que possible
-            if (!isSequence && !videoProcessingError) {
-                // Vérifier s'il y a des frames disponibles
-                if (IsFrameAvailable(0)) {
-                    LogMessage("LOG First frames available - attempting to load");
-                    printf("*** FIRST FRAMES AVAILABLE - LOADING ***\n");
-                    
-                    if (LoadExtractedFrames(&frameSequence, &videoTextureBuffer, &totalFrames, &frameRate)) {
-                        LogMessage("LOG Initial frames loaded - setting up sequence");
-                        printf("*** INITIAL FRAMES LOADED: %d frames at %.2f FPS ***\n", 
-                               totalFrames, frameRate);
-                        
-                        isSequence = true;
-                        currentFrame = 0;
-                        frameTime = 0.0f;
-                        sliderValue = 0.0f;
-                        
-                        // Charger la première frame
-                        if (frameSequence != NULL && totalFrames > 0) {
-                            // Utiliser la texture du buffer au lieu de créer une nouvelle
-                            Texture2D* firstTexture = GetTextureFromBuffer(&videoTextureBuffer, 0);
-                            if (firstTexture != NULL) {
-                                originalImageTex = *firstTexture;
-                                
-                                LogMessage("LOG First frame texture loaded from buffer");
-                                printf("*** FIRST FRAME TEXTURE LOADED FROM BUFFER: %dx%d ***\n", 
-                                       originalImageTex.width, originalImageTex.height);
-                            } else {
-                                // Fallback: créer la texture normalement
-                                originalImageTex = LoadTextureFromImage(frameSequence[0]);
-                                LogMessage("LOG First frame texture loaded (fallback)");
-                            }
-                        
-                            // Calculer les dimensions pour adapter l'image à la fenêtre
-                            float availableWidth = screenWidth - 200;
-                            float availableHeight = screenHeight;
-                            
-                            float scaleX = availableWidth / originalImageTex.width;
-                            float scaleY = availableHeight / originalImageTex.height;
-                            float scale = fminf(scaleX, scaleY);
-                            
-                            imageScale.x = scale;
-                            imageScale.y = scale;
-                            
-                            float scaledWidth = originalImageTex.width * scale;
-                            float scaledHeight = originalImageTex.height * scale;
-                            
-                            imageRect.x = 200 + (availableWidth - scaledWidth) / 2;
-                            imageRect.y = (availableHeight - scaledHeight) / 2;
-                            imageRect.width = scaledWidth;
-                            imageRect.height = scaledHeight;
-                            
-                            sourceRect.x = 0;
-                            sourceRect.y = 0;
-                            sourceRect.width = originalImageTex.width;
-                            sourceRect.height = originalImageTex.height;
-                            
-                            printf("*** VIDEO READY FOR PLAYBACK - Image rect: %.0f,%.0f %.0fx%.0f ***\n", 
-                                   imageRect.x, imageRect.y, imageRect.width, imageRect.height);
-                        }
-                    }
-                }
-            }
-            
-            if (videoProcessingError) {
-                LogMessage("LOG Video processing failed");
-                printf("ERROR: Video processing failed: %s\n", videoErrorMessage);
-                isProcessingVideo = false;
-            }
-        }
-        
-        // Vérifier et charger de nouvelles frames si nécessaire
-        if (isSequence && isProcessingVideo) {
-            if (frameCounter % 30 == 0) { // Vérifier deux fois par seconde
-                int newMaxFrames = CheckAndLoadNewFrames(&frameSequence, &videoTextureBuffer, totalFrames);
-                if (newMaxFrames > totalFrames) {
-                    totalFrames = newMaxFrames;
-                    printf("Updated total frames to: %d\n", totalFrames);
-                }
-            }
-        }
+        // En mode synchrone, pas besoin de vérifier le statut du traitement vidéo
+        // car tout est fait de manière immédiate
 
         // Mise à jour des séquences/animations avec gestion d'erreur
         if (isSequence && isPlaying) {
@@ -1164,13 +1070,21 @@ int main(void)
                 DrawText(TextFormat("Pos: %.0f,%.0f", lockedMouseInImage.x, lockedMouseInImage.y), 10, textHeight+=15, 10, RED);
             }
             
-            // Affichage du statut de traitement vidéo
-            if (isProcessingVideo) {
-                DrawText("TRAITEMENT VIDÉO...", 10, textHeight+=25, 12, ORANGE);
-                DrawText("Veuillez patienter", 10, textHeight+=15, 10, ORANGE);
-            } else if (videoProcessingError) {
+            // Affichage des erreurs de shader
+            if (shaderState.hasError) {
+                DrawText("ERREUR SHADER:", 10, textHeight+=25, 12, RED);
+                DrawText("CRITIQUE - Arrêt", 10, textHeight+=15, 10, RED);
+                DrawText(shaderState.errorMessage, 10, textHeight+=15, 8, RED);
+            } else if (shaderState.isDefaultShader) {
+                DrawText("SHADER PAR DÉFAUT:", 10, textHeight+=25, 12, ORANGE);
+                DrawText("Corrigez effect.fs", 10, textHeight+=15, 10, ORANGE);
+                DrawText("et sauvegardez", 10, textHeight+=15, 10, ORANGE);
+            }
+            
+            // Affichage du statut de traitement vidéo (simplifié)
+            if (gVideoProcessor.hasError) {
                 DrawText("ERREUR VIDÉO:", 10, textHeight+=25, 12, RED);
-                DrawText(videoErrorMessage, 10, textHeight+=15, 10, RED);
+                DrawText(gVideoProcessor.errorMessage, 10, textHeight+=15, 10, RED);
             }
             
             // Contrôles de lecture pour les séquences
@@ -1180,22 +1094,12 @@ int main(void)
                 DrawText("P: Play/Pause", 10, textHeight+=15, 10, DARKGRAY);
                 DrawText("←→: Frame prec/suiv", 10, textHeight+=15, 10, DARKGRAY);
                 
-                // Afficher un avertissement si en cours de chargement
-                if (isProcessingVideo) {
-                    DrawText("CHARGEMENT...", 10, textHeight+=15, 12, ORANGE);
-                    DrawText("Frames peuvent manquer", 10, textHeight+=15, 10, ORANGE);
-                }
-                
                 // Affichage des informations de frame
                 DrawText(TextFormat("Frame: %d/%d", currentFrame + 1, totalFrames), 10, textHeight+=20, 12, BLACK);
                 DrawText(TextFormat("FPS: %.1f", frameRate), 10, textHeight+=15, 12, BLACK);
                 
-                // Afficher le statut de chargement
-                if (isProcessingVideo) {
-                    DrawText("Chargement en cours...", 10, textHeight+=15, 10, ORANGE);
-                } else {
-                    DrawText("Chargement terminé", 10, textHeight+=15, 10, GREEN);
-                }
+                // Afficher le statut de chargement (simplifié)
+                DrawText("Chargement terminé", 10, textHeight+=15, 10, GREEN);
             }
             
             if (originalImageTex.id > 0) {
@@ -1225,7 +1129,7 @@ int main(void)
                 Vector2 mousePos = GetMousePosition();
                 
                 // Bouton Play/Pause
-                Color playButtonColor = isPlaying ? GREEN : (isProcessingVideo ? ORANGE : RED);
+                Color playButtonColor = isPlaying ? GREEN : RED;
                 if (CheckCollisionPointRec(mousePos, playPauseButton)) {
                     playButtonColor = ColorBrightness(playButtonColor, 0.2f); // Éclaircir au survol
                 }
@@ -1304,7 +1208,7 @@ int main(void)
                     // Vérifier si on peut lire la frame suivante
                     if (!isPlaying) {
                         int nextFrame = (currentFrame + 1) % totalFrames;
-                        if (frameSequence[nextFrame].data != NULL || !isProcessingVideo) {
+                        if (frameSequence[nextFrame].data != NULL) {
                             isPlaying = true;
                             LogMessage("LOG Playback started (keyboard)");
                         } else {
@@ -1357,7 +1261,7 @@ int main(void)
                 if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON) && CheckCollisionPointRec(mousePos, playPauseButton)) {
                     if (!isPlaying) {
                         int nextFrame = (currentFrame + 1) % totalFrames;
-                        if (frameSequence[nextFrame].data != NULL || !isProcessingVideo) {
+                        if (frameSequence[nextFrame].data != NULL) {
                             isPlaying = true;
                             LogMessage("LOG Playback started (button)");
                         } else {
@@ -1436,7 +1340,8 @@ int main(void)
             {
                 LogMessage("LOG Drawing imagef");
                 
-                if (applyShader)
+                // Vérifier si on peut appliquer le shader
+                if (applyShader && !shaderState.hasError && shader.id > 0)
                 {
                     // Convertir les coordonnées de la souris vers les coordonnées de l'image
                     Vector2 mouseInImage;
@@ -1487,6 +1392,14 @@ int main(void)
                 {
                     // Afficher l'image originale sans shader
                     DrawTexturePro(originalImageTex, sourceRect, imageRect, (Vector2){0, 0}, 0.0f, WHITE);
+                    
+                    // Si le shader a une erreur, afficher un message sur l'image
+                    if (shaderState.hasError) {
+                        DrawText("SHADER INVALIDE", imageRect.x + 10, imageRect.y + 10, 20, RED);
+                        DrawText("Corrigez effect.fs", imageRect.x + 10, imageRect.y + 35, 16, RED);
+                    } else if (shaderState.isDefaultShader) {
+                        DrawText("SHADER PAR DÉFAUT", imageRect.x + 10, imageRect.y + 10, 16, ORANGE);
+                    }
                 }
                 
                 // Dessiner un contour autour de l'image pour debug
