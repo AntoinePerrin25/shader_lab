@@ -797,6 +797,133 @@ void LoadAllAvailableFrames(Image** sequence, TextureBuffer* textureBuffer, int*
            loadedFrames, *totalFrames);
 }
 
+// Fonction pour initialiser les prévisualisations des shaders (optimisée)
+void InitShaderPreviews(RenderTexture2D** previews, int previewSize) {
+    if (*previews != NULL) {
+        // Libérer les anciennes prévisualisations
+        for (int i = 0; i < MAX_SHADERS; i++) {
+            if ((*previews)[i].id > 0) {
+                UnloadRenderTexture((*previews)[i]);
+            }
+        }
+        free(*previews);
+    }
+    
+    *previews = (RenderTexture2D*)calloc(MAX_SHADERS, sizeof(RenderTexture2D));
+    
+    // Créer seulement les render textures, sans générer les previews immédiatement
+    for (int i = 0; i < gShaderManager.count; i++) {
+        (*previews)[i] = LoadRenderTexture(previewSize, previewSize);
+        printf("Initialized preview texture %d for shader: %s\n", i, gShaderManager.names[i]);
+        
+        // Initialiser avec un fond blanc simple pour éviter les artifacts
+        BeginTextureMode((*previews)[i]);
+            ClearBackground(LIGHTGRAY);
+            DrawText("Loading...", 25, 50, 12, BLACK);
+        EndTextureMode();
+    }
+    
+    printf("Shader previews initialized: %d textures (lazy loading)\n", gShaderManager.count);
+}
+
+// Fonction pour générer une prévisualisation d'un shader (optimisée)
+void GenerateShaderPreview(RenderTexture2D previewTexture, Shader shader, int shaderIndex, float time) {
+    UNUSED shaderIndex; // Mark parameter as unused to avoid warning
+    
+    // Canvas statique partagé pour toutes les prévisualisations
+    static Texture2D sharedPreviewCanvas = {0};
+    static bool canvasInitialized = false;
+    
+    if (!canvasInitialized) {
+        Image whiteImage = GenImageColor(120, 120, WHITE); // Taille fixe pour les previews
+        sharedPreviewCanvas = LoadTextureFromImage(whiteImage);
+        UnloadImage(whiteImage);
+        canvasInitialized = true;
+    }
+    
+    BeginTextureMode(previewTexture);
+        ClearBackground(WHITE);
+        
+        if (shader.id > 0) {
+            BeginShaderMode(shader);
+                // Uniforms pour la prévisualisation (versions simplifiées pour performance)
+                int timeLocation = GetShaderLocation(shader, "time");
+                if (timeLocation != -1) {
+                    SetShaderValue(shader, timeLocation, &time, SHADER_UNIFORM_FLOAT);
+                }
+                
+                // Position de la souris au centre pour la prévisualisation
+                float centerMouse[2] = {60.0f, 60.0f}; // Coordonnées fixes pour preview
+                int mousePosLocation = GetShaderLocation(shader, "mousePos");
+                if (mousePosLocation != -1) {
+                    SetShaderValue(shader, mousePosLocation, centerMouse, SHADER_UNIFORM_VEC2);
+                }
+                
+                // Autres uniforms avec valeurs fixes pour performance
+                float previewRadius = 30.0f;
+                float previewPower = 1.0f;
+                int radiusLocation = GetShaderLocation(shader, "radius");
+                int powerLocation = GetShaderLocation(shader, "power");
+                if (radiusLocation != -1) SetShaderValue(shader, radiusLocation, &previewRadius, SHADER_UNIFORM_FLOAT);
+                if (powerLocation != -1) SetShaderValue(shader, powerLocation, &previewPower, SHADER_UNIFORM_FLOAT);
+                
+                float resolution[2] = {120.0f, 120.0f}; // Résolution fixe
+                int resolutionLocation = GetShaderLocation(shader, "resolution");
+                if (resolutionLocation != -1) {
+                    SetShaderValue(shader, resolutionLocation, resolution, SHADER_UNIFORM_VEC2);
+                }
+                
+                DrawTexture(sharedPreviewCanvas, 0, 0, WHITE);
+            EndShaderMode();
+        } else {
+            // Shader invalide - dessiner un carré rouge avec un X
+            DrawRectangle(0, 0, 120, 120, RED);
+            DrawText("X", 55, 55, 20, WHITE);
+        }
+    EndTextureMode();
+}
+
+// Fonction pour mettre à jour toutes les prévisualisations (optimisée)
+void UpdateShaderPreviews(RenderTexture2D* previews, float time) {
+    if (!previews) return;
+    
+    static int updateIndex = 0; // Index pour mettre à jour les shaders par rotation
+    static float lastUpdateTime = 0.0f;
+    static bool allPreviewsGenerated = false;
+    
+    // Générer toutes les previews au début, puis les laisser statiques
+    if (!allPreviewsGenerated) {
+        // Générer toutes les previews d'un coup au démarrage
+        for (int i = 0; i < gShaderManager.count; i++) {
+            if (previews[i].id > 0) {
+                ShaderState tempState = {0};
+                Shader tempShader = LoadShaderSafe(0, gShaderManager.paths[i], &tempState);
+                
+                // Utiliser un temps fixe (2.0f) pour des previews statiques
+                GenerateShaderPreview(previews[i], tempShader, i, 2.0f);
+                
+                if (tempShader.id > 0) {
+                    UnloadShader(tempShader);
+                }
+            }
+        }
+        allPreviewsGenerated = true;
+        printf("All shader previews generated (static)\n");
+    }
+}
+
+// Fonction pour libérer les prévisualisations
+void FreeShaderPreviews(RenderTexture2D* previews) {
+    if (!previews) return;
+    
+    for (int i = 0; i < MAX_SHADERS; i++) {
+        if (previews[i].id > 0) {
+            UnloadRenderTexture(previews[i]);
+        }
+    }
+    free(previews);
+}
+
 
 int main(void)
 {
@@ -808,13 +935,26 @@ int main(void)
     LogMessage("LOG Video processor initialized");
     
     const int screenWidth = 1080;
-    const int screenHeight = 720;
+    const int screenHeight = 900; // Augmenté pour faire place au panel de prévisualisation
+    
+// Variables pour le nouveau système de prévisualisation des shaders
+    const int previewPanelHeight = 240; // Increased height for multiple rows
+    const int previewSize = 120;
+    const int previewSpacing = 130;
+    RenderTexture2D* shaderPreviews = NULL; // Textures de prévisualisation pour chaque shader
+    bool previewsNeedUpdate = true; // Flag pour savoir si les previews doivent être mise à jour
+    float lastPreviewUpdateTime = 0.0f; // Dernière fois que les previews ont été mises à jour
+    
     InitWindow(screenWidth, screenHeight, "Drag & Drop + Shader Zone");
     LogMessage("LOG Window Initialized");
 
     // Découvrir les shaders disponibles
     DiscoverShaders();
     LogMessage("LOG Shaders discovered");
+    
+    // Initialize shader previews
+    InitShaderPreviews(&shaderPreviews, previewSize);
+    LogMessage("LOG Shader previews initialized");
 
     const char *shaderPath = GetSelectedShaderPath();
     ShaderState shaderState = {0};
@@ -825,6 +965,8 @@ int main(void)
     LogMessage("LOG File mod time retrieved");
 
     Texture2D originalImageTex = {0}; // Image originale non modifiée
+    Texture2D canvasTexture = {0}; // Texture canvas blanche pour les shaders sans image
+    bool useCanvas = false; // Indique si on utilise le canvas ou une image
     LogMessage("LOG Image textures initialized");
     
     // Variables pour la gestion de l'image redimensionnée
@@ -855,11 +997,11 @@ int main(void)
     Rectangle loadAllButton = {100, 620, 90, 30};
     float sliderValue = 0.0f;
     
-    // Variables pour le dropdown des shaders
+    // Variables pour le dropdown des shaders (ancien système - sera remplacé)
     Rectangle shaderDropdown = {10, 50, 180, 25};
     Rectangle shaderReloadButton = {10, 80, 100, 25};
     Rectangle shaderDropdownList = {10, 75, 180, 200}; // Position de la liste déroulante
-
+    
     // Variables pour le système de verrouillage de la souris
     bool mouseLocked = false;
     Vector2 lockedMouseInImage = {0, 0};
@@ -870,6 +1012,43 @@ int main(void)
     UNUSED powerIndex;
     SetTargetFPS(60);
     LogMessage("LOG FPS set to 60");
+
+    // Créer un canvas blanc par défaut pour les shaders
+    Image whiteCanvas = GenImageColor(800, 600, WHITE);
+    canvasTexture = LoadTextureFromImage(whiteCanvas);
+    UnloadImage(whiteCanvas);
+    useCanvas = true;
+    
+    // Calculer les dimensions pour le canvas (en tenant compte du panel de prévisualisation)
+    float availableWidth = screenWidth - 200; // Largeur disponible (écran - panel)
+    float availableHeight = screenHeight - previewPanelHeight; // Hauteur disponible (écran - panel preview)
+    
+    float scaleX = availableWidth / canvasTexture.width;
+    float scaleY = availableHeight / canvasTexture.height;
+    float scale = fminf(scaleX, scaleY); // Garder les proportions
+    
+    imageScale.x = scale;
+    imageScale.y = scale;
+    
+    // Centrer le canvas dans la zone disponible
+    float scaledWidth = canvasTexture.width * scale;
+    float scaledHeight = canvasTexture.height * scale;
+    
+    imageRect.x = 200 + (availableWidth - scaledWidth) / 2;
+    imageRect.y = (availableHeight - scaledHeight) / 2;
+    imageRect.width = scaledWidth;
+    imageRect.height = scaledHeight;
+    
+    sourceRect.x = 0;
+    sourceRect.y = 0;
+    sourceRect.width = canvasTexture.width;
+    sourceRect.height = canvasTexture.height;
+    
+    LogMessage("LOG White canvas initialized");
+    
+    // Initialiser les prévisualisations des shaders
+    InitShaderPreviews(&shaderPreviews, previewSize);
+    LogMessage("LOG Shader previews initialized");
 
     while (!WindowShouldClose())
     {
@@ -915,6 +1094,9 @@ int main(void)
                     originalImageTex = LoadTextureFromImage(img);
                     UnloadImage(img);
                     
+                    // Passer en mode image (désactiver le canvas)
+                    useCanvas = false;
+                    
                     // Réinitialiser les variables de séquence
                     isSequence = false;
                     isPlaying = false;
@@ -930,7 +1112,7 @@ int main(void)
                     
                     // Calculer les dimensions pour adapter l'image à la fenêtre
                     float availableWidth = screenWidth - 200; // Largeur disponible (écran - panel)
-                    float availableHeight = screenHeight;
+                    float availableHeight = screenHeight - previewPanelHeight; // Hauteur disponible (écran - panel preview)
                     
                     float scaleX = availableWidth / originalImageTex.width;
                     float scaleY = availableHeight / originalImageTex.height;
@@ -979,6 +1161,9 @@ int main(void)
                     if (StartVideoProcessing(files.paths[0])) {
                         strcpy(loadedFilePath, files.paths[0]);
                         
+                        // Passer en mode vidéo (désactiver le canvas)
+                        useCanvas = false;
+                        
                         // En mode synchrone, charger immédiatement les frames
                         if (LoadExtractedFrames(&frameSequence, &videoTextureBuffer, &totalFrames, &frameRate)) {
                             LogMessage("LOG Video frames loaded successfully");
@@ -1000,7 +1185,7 @@ int main(void)
                                 
                                 // Calculer les dimensions pour adapter l'image à la fenêtre
                                 float availableWidth = screenWidth - 200;
-                                float availableHeight = screenHeight;
+                                float availableHeight = screenHeight - previewPanelHeight;
                                 
                                 float scaleX = availableWidth / originalImageTex.width;
                                 float scaleY = availableHeight / originalImageTex.height;
@@ -1065,12 +1250,12 @@ int main(void)
             if (mouseLocked) {
                 // Bloquer la position actuelle de la souris
                 Vector2 mouse = GetMousePosition();
-                if (originalImageTex.id > 0 && CheckCollisionPointRec(mouse, imageRect)) {
+                if ((originalImageTex.id > 0 || useCanvas) && CheckCollisionPointRec(mouse, imageRect)) {
                     lockedMouseInImage.x = (mouse.x - imageRect.x) / imageScale.x;
                     lockedMouseInImage.y = (mouse.y - imageRect.y) / imageScale.y;
                     LogMessage("LOG Mouse position locked");
                 } else {
-                    mouseLocked = false; // Ne pas verrouiller si la souris n'est pas sur l'image
+                    mouseLocked = false; // Ne pas verrouiller si la souris n'est pas sur l'image/canvas
                 }
             } else {
                 LogMessage("LOG Mouse position unlocked");
@@ -1091,6 +1276,7 @@ int main(void)
                 shader = LoadShaderSafe(0, newShaderPath, &shaderState);
                 lastModTime = My_GetFileModTime(newShaderPath);
                 LogMessage("LOG Switched to previous shader");
+                previewsNeedUpdate = true; // Force preview update
             }
         }
         
@@ -1106,6 +1292,7 @@ int main(void)
                 shader = LoadShaderSafe(0, newShaderPath, &shaderState);
                 lastModTime = My_GetFileModTime(newShaderPath);
                 LogMessage("LOG Switched to next shader");
+                previewsNeedUpdate = true; // Force preview update
             }
         }
         
@@ -1118,6 +1305,45 @@ int main(void)
             shader = LoadShaderSafe(0, currentShaderPath, &shaderState);
             lastModTime = My_GetFileModTime(currentShaderPath);
             LogMessage("LOG Shader manually reloaded");
+            previewsNeedUpdate = true; // Force preview update
+        }
+        
+        // Retour au mode canvas avec C
+        if (IsKeyPressed(KEY_C)) {
+            printf("Switching to canvas mode\n");
+            useCanvas = true;
+            isSequence = false;
+            isPlaying = false;
+            currentFrame = 0;
+            totalFrames = 1;
+            frameTime = 0.0f;
+            sliderValue = 0.0f;
+            
+            // Recalculer les dimensions pour le canvas
+            float availableWidth = screenWidth - 200;
+            float availableHeight = screenHeight - previewPanelHeight;
+            
+            float scaleX = availableWidth / canvasTexture.width;
+            float scaleY = availableHeight / canvasTexture.height;
+            float scale = fminf(scaleX, scaleY);
+            
+            imageScale.x = scale;
+            imageScale.y = scale;
+            
+            float scaledWidth = canvasTexture.width * scale;
+            float scaledHeight = canvasTexture.height * scale;
+            
+            imageRect.x = 200 + (availableWidth - scaledWidth) / 2;
+            imageRect.y = (availableHeight - scaledHeight) / 2;
+            imageRect.width = scaledWidth;
+            imageRect.height = scaledHeight;
+            
+            sourceRect.x = 0;
+            sourceRect.y = 0;
+            sourceRect.width = canvasTexture.width;
+            sourceRect.height = canvasTexture.height;
+            
+            LogMessage("LOG Switched to canvas mode");
         }
 
         // En mode synchrone, pas besoin de vérifier le statut du traitement vidéo
@@ -1183,7 +1409,7 @@ int main(void)
         }
 
         // Panel gauche (étendu pour inclure les boutons)
-        Rectangle panel = {0, 0, 200, screenHeight};
+        Rectangle panel = {0, 0, 200, screenHeight - previewPanelHeight};
 
         // Gestion clic + shader (maintenir le clic pour appliquer continuellement)
         Vector2 mouse = GetMousePosition();
@@ -1212,13 +1438,13 @@ int main(void)
         
         if (mouseLocked) {
             // Si la souris est verrouillée, appliquer le shader en permanence à la position verrouillée
-            applyShader = originalImageTex.id > 0;
+            applyShader = (originalImageTex.id > 0 || useCanvas);
         } else {
             // Comportement normal : clic gauche pour appliquer le shader
             applyShader = (IsMouseButtonDown(MOUSE_LEFT_BUTTON) || IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) && 
                           !CheckCollisionPointRec(mouse, panel) && 
                           !mouseOnUI &&
-                          originalImageTex.id > 0 && 
+                          (originalImageTex.id > 0 || useCanvas) && 
                           CheckCollisionPointRec(mouse, imageRect);
         }
         
@@ -1232,6 +1458,15 @@ int main(void)
 
         BeginDrawing();
             ClearBackground(RAYWHITE);
+            
+            // Update shader previews only when needed (not every frame)
+            float currentTime = GetTime();
+            if (previewsNeedUpdate) {
+                UpdateShaderPreviews(shaderPreviews, currentTime);
+                previewsNeedUpdate = false;
+                printf("Shader previews updated\n");
+            }
+            
             unsigned int textHeight = 10; 
             // Draw panel
             DrawRectangleRec(panel, LIGHTGRAY);
@@ -1330,6 +1565,9 @@ int main(void)
             DrawText("Puissance : +/-", 10, textHeight+=25, 14, BLACK);
             DrawText(TextFormat("Puissance: %.0f", power), 10, textHeight+=25, 14, BLACK);
             DrawText("Espace: Bloquer souris", 10, textHeight+=25, 12, BLACK);
+            DrawText("C: Mode Canvas", 10, textHeight+=25, 12, BLACK);
+            DrawText("Q/E: Shaders", 10, textHeight+=25, 12, BLACK);
+            DrawText("R: Recharger", 10, textHeight+=25, 12, BLACK);
             
             if (mouseLocked) {
                 DrawText("SOURIS BLOQUÉE", 10, textHeight+=25, 12, RED);
@@ -1683,14 +1921,17 @@ int main(void)
             }
 
             // Draw image with shader if needed
-            if (originalImageTex.id > 0)
+            if (originalImageTex.id > 0 || useCanvas)
             {
-                LogMessage("LOG Drawing imagef");
+                // Choisir la texture à utiliser
+                Texture2D currentTexture = useCanvas ? canvasTexture : originalImageTex;
+                
+                LogMessage("LOG Drawing image/canvas");
                 
                 // Vérifier si on peut appliquer le shader
                 if (applyShader && !shaderState.hasError && shader.id > 0)
                 {
-                    // Convertir les coordonnées de la souris vers les coordonnées de l'image
+                    // Convertir les coordonnées de la souris vers les coordonnées de l'image/canvas
                     Vector2 mouseInImage;
                     if (mouseLocked) {
                         mouseInImage = effectiveMouseInImage;
@@ -1699,9 +1940,9 @@ int main(void)
                         mouseInImage.y = (mouse.y - imageRect.y) / imageScale.y;
                     }
                     
-                    // S'assurer que les coordonnées sont dans les limites de l'image
-                    mouseInImage.x = fmaxf(0, fminf(mouseInImage.x, originalImageTex.width));
-                    mouseInImage.y = fmaxf(0, fminf(mouseInImage.y, originalImageTex.height));
+                    // S'assurer que les coordonnées sont dans les limites de l'image/canvas
+                    mouseInImage.x = fmaxf(0, fminf(mouseInImage.x, currentTexture.width));
+                    mouseInImage.y = fmaxf(0, fminf(mouseInImage.y, currentTexture.height));
 
                     // Obtenir le temps en secondes depuis le lancement du programme
                     float timeSeconds = (float)GetTime();
@@ -1729,41 +1970,166 @@ int main(void)
                         SetShaderValue(shader, GetShaderLocation(shader, "radius"), &radius, SHADER_UNIFORM_FLOAT);
                         SetShaderValue(shader, GetShaderLocation(shader, "power"), &power, SHADER_UNIFORM_FLOAT);
                         SetShaderValue(shader, GetShaderLocation(shader, "resolution"), 
-                                     (float[2]){(float)originalImageTex.width, (float)originalImageTex.height}, SHADER_UNIFORM_VEC2);
+                                     (float[2]){(float)currentTexture.width, (float)currentTexture.height}, SHADER_UNIFORM_VEC2);
 
-                        DrawTexturePro(originalImageTex, sourceRect, imageRect, (Vector2){0, 0}, 0.0f, WHITE);
+                        DrawTexturePro(currentTexture, sourceRect, imageRect, (Vector2){0, 0}, 0.0f, WHITE);
                     EndShaderMode();
-                    LogMessage("LOG Shader applied to image");
+                    LogMessage("LOG Shader applied to image/canvas");
                 }
                 else
                 {
-                    // Afficher l'image originale sans shader
-                    DrawTexturePro(originalImageTex, sourceRect, imageRect, (Vector2){0, 0}, 0.0f, WHITE);
+                    // Afficher l'image/canvas original(e) sans shader
+                    DrawTexturePro(currentTexture, sourceRect, imageRect, (Vector2){0, 0}, 0.0f, WHITE);
                     
-                    // Si le shader a une erreur, afficher un message sur l'image
+                    // Si le shader a une erreur, afficher un message sur l'image/canvas
                     if (shaderState.hasError) {
                         DrawText("SHADER INVALIDE", imageRect.x + 10, imageRect.y + 10, 20, RED);
-                        DrawText("Corrigez effect.fs", imageRect.x + 10, imageRect.y + 35, 16, RED);
+                        DrawText("Corrigez le shader", imageRect.x + 10, imageRect.y + 35, 16, RED);
                     } else if (shaderState.isDefaultShader) {
                         DrawText("SHADER PAR DÉFAUT", imageRect.x + 10, imageRect.y + 10, 16, ORANGE);
                     }
                 }
                 
-                // Dessiner un contour autour de l'image pour debug
+                // Dessiner un contour autour de l'image/canvas pour debug
                 DrawRectangleLinesEx(imageRect, 2, DARKGRAY);
+                
+                // Si on utilise le canvas, afficher une indication
+                if (useCanvas) {
+                    DrawText("Canvas Mode - Drag image to switch", imageRect.x + 10, imageRect.y + imageRect.height - 25, 12, DARKGRAY);
+                }
             }
             else
             {
-                // Afficher un message si aucune image n'est chargée
-                DrawText("Glissez une image/vidéo ici", 250, 300, 20, DARKGRAY);
-                DrawText("Formats supportés:", 250, 330, 16, GRAY);
-                DrawText("Images: PNG, JPG, BMP, TGA, GIF, HDR, PIC, PSD", 250, 350, 14, GRAY);
-                DrawText("Vidéos: MP4, MOV, AVI, MKV, WEBM", 250, 370, 14, GRAY);
-                DrawText("(Nécessite FFmpeg installé)", 250, 390, 12, GRAY);
-                DrawText("Zone d'affichage:", 210, 50, 16, GRAY);
-                Rectangle dropZone = {200, 0, screenWidth - 200, screenHeight};
-                DrawRectangleLinesEx(dropZone, 2, LIGHTGRAY);
+                // Ceci ne devrait jamais arriver maintenant qu'on a le canvas par défaut
+                DrawText("Erreur: Aucune texture disponible", 250, 300, 20, RED);
             }
+
+        
+        // Render preview panel
+        Rectangle previewPanel = {0, screenHeight - previewPanelHeight, screenWidth, previewPanelHeight};
+        DrawRectangleRec(previewPanel, (Color){20, 20, 20, 255});
+        DrawRectangleLinesEx(previewPanel, 2, (Color){100, 100, 100, 255});
+        
+        // Calculate optimal grid layout to fit all shaders in the available space
+        int availableWidth = screenWidth - 20; // Leave 10px margin on each side
+        int availableHeight = previewPanelHeight - 20; // Leave 10px margin top/bottom
+        
+        // Calculate how many rows we can fit (reserve 20px for text below each preview)
+        int maxRowsAvailable = availableHeight / (40 + 20); // Minimum 40px for preview + 20px for text
+        if (maxRowsAvailable < 1) maxRowsAvailable = 1;
+        
+        // Calculate optimal previews per row to distribute shaders evenly across available rows
+        // Prefer more columns to better utilize horizontal space
+        int optimalPreviewsPerRow = (gShaderManager.count + maxRowsAvailable - 1) / maxRowsAvailable;
+        
+        // Ensure we don't exceed what fits horizontally - allow more columns with smaller previews
+        int maxPreviewsPerRowWidth = availableWidth / (25 + 6); // Minimum 25px + 6px spacing for more columns
+        if (optimalPreviewsPerRow > maxPreviewsPerRowWidth) {
+            optimalPreviewsPerRow = maxPreviewsPerRowWidth;
+        }
+        
+        // Force minimum number of columns to better utilize horizontal space
+        if (optimalPreviewsPerRow < 18 && gShaderManager.count > 18) {
+            optimalPreviewsPerRow = 18; // Try to fit at least 12 per row
+        }
+        if (optimalPreviewsPerRow < 1) optimalPreviewsPerRow = 1;
+        
+        // Calculate the actual number of rows needed
+        int actualRowCount = (gShaderManager.count + optimalPreviewsPerRow - 1) / optimalPreviewsPerRow;
+        
+        // Calculate dynamic preview size based on available space (optimized for more columns)
+        int actualPreviewSize = (availableWidth - (optimalPreviewsPerRow + 1) * 6) / optimalPreviewsPerRow;
+        if (actualPreviewSize > previewSize / 2) actualPreviewSize = previewSize / 2; // Cap at half original size (60px)
+        if (actualPreviewSize < 25) actualPreviewSize = 25; // Smaller minimum for more columns
+        
+        // If we have too many rows, make previews smaller to fit vertically
+        int maxPreviewSizeForHeight = (availableHeight - (actualRowCount * 20)) / actualRowCount; // Account for text space
+        if (actualPreviewSize > maxPreviewSizeForHeight && maxPreviewSizeForHeight >= 20) {
+            actualPreviewSize = maxPreviewSizeForHeight;
+        }
+        
+        int actualSpacing = actualPreviewSize + 6; // Reduced spacing for more columns
+        int rowHeight = actualPreviewSize + 20; // Space for preview + text (reduced)
+        
+        // Center the grid both horizontally and vertically
+        int startX = (screenWidth - (optimalPreviewsPerRow * actualSpacing - 6)) / 2; // Adjusted for reduced spacing
+        int totalGridHeight = actualRowCount * rowHeight - 5; // -5 to remove last row's extra spacing
+        int startY = screenHeight - previewPanelHeight + (previewPanelHeight - totalGridHeight) / 2;
+        
+        // Render shader previews in optimized grid layout
+        for (int i = 0; i < gShaderManager.count; i++) {
+            if (i < MAX_SHADERS && shaderPreviews[i].id > 0) {
+                int col = i % optimalPreviewsPerRow;
+                int row = i / optimalPreviewsPerRow;
+                int x = startX + col * actualSpacing;
+                int y = startY + row * rowHeight;
+                
+                // Draw preview thumbnail
+                Rectangle previewRect = {x, y, actualPreviewSize, actualPreviewSize};
+                
+                // Scale the preview texture to fit the dynamic size
+                Rectangle sourceRect = {0, 0, previewSize, previewSize};
+                DrawTexturePro(shaderPreviews[i].texture, sourceRect, previewRect, (Vector2){0, 0}, 0.0f, WHITE);
+                
+                // Highlight if this is the current shader
+                if (i == gShaderManager.selectedIndex) {
+                    DrawRectangleLinesEx(previewRect, 3, (Color){255, 255, 0, 255});
+                } else {
+                    DrawRectangleLinesEx(previewRect, 1, (Color){150, 150, 150, 255});
+                }
+                
+                // Draw shader name below thumbnail with adaptive text size
+                const char* shaderName = gShaderManager.names[i];
+                int textSize = (actualPreviewSize < 30) ? 5 : ((actualPreviewSize < 40) ? 6 : 7); // Smaller text sizes for more compact layout
+                int textWidth = MeasureText(shaderName, textSize);
+                int textX = x + (actualPreviewSize - textWidth) / 2;
+                
+                // Ensure text doesn't overflow
+                if (textWidth > actualPreviewSize) {
+                    textX = x;
+                    // Optionally truncate text if too long (shorter for smaller previews)
+                    char truncatedName[16];
+                    snprintf(truncatedName, sizeof(truncatedName), "%.12s...", shaderName);
+                    if (strlen(shaderName) > 12) {
+                        DrawText(truncatedName, textX, y + actualPreviewSize + 2, textSize, WHITE);
+                    } else {
+                        DrawText(shaderName, textX, y + actualPreviewSize + 2, textSize, WHITE);
+                    }
+                } else {
+                    DrawText(shaderName, textX, y + actualPreviewSize + 2, textSize, WHITE);
+                }
+                
+                // Check for mouse click on preview
+                if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+                    Vector2 mousePos = GetMousePosition();
+                    if (CheckCollisionPointRec(mousePos, previewRect)) {
+                        printf("Clicked on shader preview %d: %s\n", i, gShaderManager.names[i]);
+                        gShaderManager.selectedIndex = i;
+                        
+                        // Reload shader
+                        const char* newShaderPath = GetSelectedShaderPath();
+                        printf("Switching to shader: %s\n", newShaderPath);
+                        
+                        UnloadShader(shader);
+                        shader = LoadShaderSafe(0, newShaderPath, &shaderState);
+                        lastModTime = My_GetFileModTime(newShaderPath);
+                        
+                        LogMessage("LOG Shader switched via preview click");
+                        previewsNeedUpdate = true; // Force preview update if needed
+                    }
+                }
+            }
+        }
+        
+        // Draw debug info for grid layout
+        static bool showDebugInfo = false;
+        if (IsKeyPressed(KEY_F1)) showDebugInfo = !showDebugInfo;
+        
+        if (showDebugInfo) {
+            DrawText(TextFormat("Shaders: %d | Rows: %d | Per Row: %d | Size: %d", 
+                gShaderManager.count, actualRowCount, optimalPreviewsPerRow, actualPreviewSize), 
+                10, screenHeight - previewPanelHeight + 5, 10, GREEN);
+        }
 
         EndDrawing();
     }
@@ -1775,6 +2141,7 @@ int main(void)
     LogMessage("LOG Video processor cleaned up");
     
     if (originalImageTex.id > 0) UnloadTexture(originalImageTex);
+    if (canvasTexture.id > 0) UnloadTexture(canvasTexture);
     
     // Nettoyer les séquences d'images
     if (frameSequence != NULL) {
@@ -1786,6 +2153,9 @@ int main(void)
     
     // Nettoyer le buffer de textures
     FreeTextureBuffer(&videoTextureBuffer);
+    
+    // Free shader previews
+    FreeShaderPreviews(shaderPreviews);
     
     UnloadShader(shader);
     CloseWindow();
