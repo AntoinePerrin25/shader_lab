@@ -23,7 +23,6 @@ Then run nob and the program :
 
 ## WARNING
 
-- It does not work in every terminal (example VSCode terminal make it work the first time only)
 - Program was tested on Windows 10 only, it may not work on other OS.
 
 
