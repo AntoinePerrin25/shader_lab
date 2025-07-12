@@ -5,11 +5,35 @@
 #include "../include/raymath.h" // For Vector2 math functions
 #include <stdbool.h>
 #include <float.h>   // For FLT_MAX
+#include <stdio.h>   // For FILE*
 
 #define SCREEN_WIDTH 1080
 #define SCREEN_HEIGHT 720
 
 #define EPSILON2 0.0001f
+
+// Logging system types
+#define ENABLE_LOGGING 1
+#define MAX_LOG_BUFFER 64
+#define MAX_MESSAGE_LENGTH 256
+
+typedef struct {
+    char messages[MAX_LOG_BUFFER][MAX_MESSAGE_LENGTH];
+    int messageCount;
+    int writeIndex;
+    FILE* logFile;
+    char lastMessage[MAX_MESSAGE_LENGTH];
+    int consecutiveCount;
+} LogManager;
+
+// Global logger instance
+extern LogManager gLogManager;
+
+// Logging function prototypes
+void InitLogger(void);
+void LogMessage(const char* message);
+void FlushConsecutiveMessages(void);
+void CloseLogger(void);
 
 // Forward declarations
 typedef struct Ball Ball;
