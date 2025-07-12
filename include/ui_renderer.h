@@ -15,6 +15,8 @@ typedef struct {
     int gridRows;
     float gridSpacing;
     int textSize;
+    float scrollOffset;
+    float maxScrollOffset;
 } UIState;
 
 // Function prototypes for UI rendering
